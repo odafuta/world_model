@@ -69,7 +69,7 @@ config = MATWMConfig(
     use_gamma_progress=False,  # ★ FALSE for this script
 )
 
-print(f'\n⚠️  TEST VERSION - Short training (2000 steps)')
+print(f'\n[TEST VERSION] - Short training (2000 steps)')
 print(f'use_gamma_progress: {config.use_gamma_progress}')
 print(f'Total steps: {config.total_steps}')
 print(f'Warmup steps: {config.warmup_steps}')
@@ -141,7 +141,7 @@ def train_matwm_with_curiosity(config, curiosity_config, save_dir='results_gamma
         for agent in agents.values():
             agent.actor.apply(init_weights)
             agent.critic.apply(init_weights)
-        print('✓ Weight initialization complete')
+        print('[OK] Weight initialization complete')
     
     curiosity_managers = create_curiosity_managers(
         agent_names,
@@ -163,7 +163,7 @@ def train_matwm_with_curiosity(config, curiosity_config, save_dir='results_gamma
         episode_rewards, training_metrics, start_step = load_full_checkpoint(
             agents, shared_wm, shared_wm_opt, resume_from, device
         )
-        print(f'✓ Resumed from step {start_step}')
+        print(f'[OK] Resumed from step {start_step}')
     
     os.makedirs(save_dir, exist_ok=True)
     timestamp = time.strftime('%Y%m%d_%H%M%S')
@@ -259,7 +259,7 @@ def train_matwm_with_curiosity(config, curiosity_config, save_dir='results_gamma
                     episode_rewards, training_metrics, global_step,
                     os.path.join(ckpt_dir, 'full_checkpoint.pt')
                 )
-                print(f'\n✓ Checkpoint saved at step {global_step}')
+                print(f'\n[OK] Checkpoint saved at step {global_step}')
             
             if all(done.values()):
                 break
@@ -311,4 +311,4 @@ if __name__ == '__main__':
     agents, episode_rewards, training_metrics, episode_curiosity, curiosity_metrics = \
         train_matwm_with_curiosity(config, curiosity_config, save_dir='results_gamma_false_test')
     
-    print(f'\n✓ TEST training completed!')
+    print(f'\n[OK] TEST training completed!')

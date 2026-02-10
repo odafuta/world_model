@@ -77,7 +77,7 @@ def initialize_matwm_weights(world_model, actor, critic):
     world_model.apply(init_weights)
     actor.apply(init_weights)
     critic.apply(init_weights)
-    print("✓ Weight initialization complete")
+    print("[OK] Weight initialization complete")
 
 
 # ============================================================================
@@ -118,7 +118,7 @@ def save_full_checkpoint(agents, shared_world_model, shared_wm_optimizer,
         }
     
     torch.save(checkpoint, path)
-    print(f"✓ Full checkpoint saved to {path}")
+    print(f"[OK] Full checkpoint saved to {path}")
 
 
 def load_full_checkpoint(agents, shared_world_model, shared_wm_optimizer, path, device):
@@ -142,7 +142,7 @@ def load_full_checkpoint(agents, shared_world_model, shared_wm_optimizer, path, 
             agent.actor_optimizer.load_state_dict(checkpoint['agents'][name]['actor_optimizer'])
             agent.critic_optimizer.load_state_dict(checkpoint['agents'][name]['critic_optimizer'])
     
-    print(f"✓ Full checkpoint loaded from {path}")
+    print(f"[OK] Full checkpoint loaded from {path}")
     
     return (
         checkpoint.get('episode_rewards', {}),
@@ -281,7 +281,7 @@ def plot_training_progress(episode_rewards, training_metrics, save_path='trainin
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"✓ Training curves saved to {save_path}")
+    print(f"[OK] Training curves saved to {save_path}")
     plt.show()
 
 
@@ -355,43 +355,43 @@ def inspect_matwm_architecture(world_model, actor, critic, config, device):
     
     try:
         z, z_logits = world_model.encode(dummy_obs)
-        print(f"✓ Encoder output (latent): {z.shape}")
-        print(f"✓ Encoder output (logits): {z_logits.shape}")
+        print(f"[OK] Encoder output (latent): {z.shape}")
+        print(f"[OK] Encoder output (logits): {z_logits.shape}")
         
         obs_recon = world_model.decode(z)
-        print(f"✓ Decoder output (reconstruction): {obs_recon.shape}")
+        print(f"[OK] Decoder output (reconstruction): {obs_recon.shape}")
         
         dummy_action = torch.randint(0, config.action_dim, (1, 1)).to(device)
         z_next, z_next_logits = world_model.predict_next(z.unsqueeze(1), dummy_action)
-        print(f"✓ Dynamics output (next latent): {z_next.shape}")
+        print(f"[OK] Dynamics output (next latent): {z_next.shape}")
         
         reward_logits = world_model.predict_reward(z_next)
-        print(f"✓ Reward predictor output: {reward_logits.shape}")
+        print(f"[OK] Reward predictor output: {reward_logits.shape}")
         
         cont_logits = world_model.predict_continuation(z_next)
-        print(f"✓ Continuation predictor output: {cont_logits.shape}")
+        print(f"[OK] Continuation predictor output: {cont_logits.shape}")
         
         teammate_logits = world_model.predict_teammates(z.unsqueeze(1), 0)
-        print(f"✓ Teammate predictor output: {len(teammate_logits)} agents")
+        print(f"[OK] Teammate predictor output: {len(teammate_logits)} agents")
         for agent_idx, logits in teammate_logits.items():
             print(f"  - Agent {agent_idx}: {logits.shape}")
     
     except Exception as e:
-        print(f"✗ Error during forward pass: {e}")
+        print(f"[X] Error during forward pass: {e}")
     
     # Test Actor
     try:
         action_logits = actor(z)
-        print(f"✓ Actor output (action logits): {action_logits.shape}")
+        print(f"[OK] Actor output (action logits): {action_logits.shape}")
     except Exception as e:
-        print(f"✗ Actor error: {e}")
+        print(f"[X] Actor error: {e}")
     
     # Test Critic
     try:
         value = critic(z)
-        print(f"✓ Critic output (value): {value.shape}")
+        print(f"[OK] Critic output (value): {value.shape}")
     except Exception as e:
-        print(f"✗ Critic error: {e}")
+        print(f"[X] Critic error: {e}")
     
     # 2. Layer count
     print(f"\n[2] Layer Count")
@@ -447,7 +447,7 @@ def inspect_matwm_architecture(world_model, actor, critic, config, device):
                     device=device, depth=3, col_names=["input_size", "output_size", "num_params"])
             print(result)
         except Exception as e:
-            print(f"⚠ Encoder summary failed: {type(e).__name__}: {e}")
+            print(f"[!] Encoder summary failed: {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
         
@@ -461,7 +461,7 @@ def inspect_matwm_architecture(world_model, actor, critic, config, device):
                     device=device, depth=3, col_names=["input_size", "output_size", "num_params"])
             print(result)
         except Exception as e:
-            print(f"⚠ Dynamics summary failed: {type(e).__name__}: {e}")
+            print(f"[!] Dynamics summary failed: {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
         
@@ -471,7 +471,7 @@ def inspect_matwm_architecture(world_model, actor, critic, config, device):
                     device=device, depth=3, col_names=["input_size", "output_size", "num_params"])
             print(result)
         except Exception as e:
-            print(f"⚠ Actor summary failed: {type(e).__name__}: {e}")
+            print(f"[!] Actor summary failed: {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
         
@@ -481,16 +481,16 @@ def inspect_matwm_architecture(world_model, actor, critic, config, device):
                     device=device, depth=3, col_names=["input_size", "output_size", "num_params"])
             print(result)
         except Exception as e:
-            print(f"⚠ Critic summary failed: {type(e).__name__}: {e}")
+            print(f"[!] Critic summary failed: {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
         
     except ImportError as e:
-        print(f"⚠ torchinfo not installed: {e}")
+        print(f"[!] torchinfo not installed: {e}")
         print("   Install with: pip install torchinfo")
         print("   Skipping detailed model summary.")
     except Exception as e:
-        print(f"⚠ Unexpected error with torchinfo: {type(e).__name__}: {e}")
+        print(f"[!] Unexpected error with torchinfo: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
     
@@ -639,7 +639,7 @@ def print_gpu_info():
             print(f"  GPU {gpu['id']}: {gpu_type}")
     
     else:
-        print("\n⚠ No GPU available. Training will run on CPU (very slow).")
+        print("\n[!] No GPU available. Training will run on CPU (very slow).")
     
     print("\n" + "="*70 + "\n")
     
@@ -671,8 +671,8 @@ def setup_matwm_training(config, device):
     gpu_info = print_gpu_info()
     
     # Create models (will be done in notebook)
-    print("✓ GPU environment checked")
-    print("✓ Ready for model initialization")
+    print("[OK] GPU environment checked")
+    print("[OK] Ready for model initialization")
     
     print("\nNext steps:")
     print("1. Create shared world model with: MATWMAgent.create_shared_world_model()")
