@@ -456,6 +456,267 @@ class RunningEMA:
 
 
 # ====================================================================
+# 3.5. γ-Progress 好奇心 (Kim et al. 2020)
+# ====================================================================
+
+class GammaProgressReward:
+    """
+    γ-Progress: Learning Progress-based Intrinsic Reward
+    
+    Reference: "Active World Model Learning with Progress Curiosity" (Kim et al. 2020)
+    
+    Concept:
+        r_progress = L(θ_old, x) - L(θ_new, x)
+        
+        where:
+        - θ_new: Current World Model parameters
+        - θ_old: EMA of past World Model parameters (θ_old ← γ·θ_old + (1-γ)·θ_new)
+        - L(θ, x): World Model prediction loss on experience x
+        
+    Key Insight:
+        Unlike standard curiosity (e.g., ICM, RND) that rewards prediction error,
+        γ-Progress rewards *learning progress* - the improvement in prediction accuracy.
+        
+        Benefits:
+        1. Overcomes "white noise problem": Random noise causes high prediction error
+           but no learning progress, so γ-Progress correctly assigns zero reward.
+        2. Focuses exploration on learnable complexity: Rewards states where the
+           World Model is actively improving its predictions.
+        3. Naturally decays: As the World Model converges, learning progress → 0,
+           automatically shifting from exploration to exploitation.
+    
+    Usage:
+        # In training loop (after World Model update):
+        gamma_progress = GammaProgressReward(config, world_model, world_model_ema, device)
+        intrinsic_reward = gamma_progress.compute(obs, action, next_obs, reward, done, teammate_actions)
+        total_reward = env_reward + config.gamma_progress_weight * intrinsic_reward
+    """
+    
+    def __init__(
+        self,
+        config,
+        world_model,
+        world_model_ema,
+        device: torch.device
+    ):
+        """
+        Args:
+            config: MATWMConfig with gamma_progress_weight
+            world_model: Current World Model (θ_new)
+            world_model_ema: EMA World Model (θ_old)
+            device: torch device
+        """
+        self.config = config
+        self.world_model = world_model
+        self.world_model_ema = world_model_ema
+        self.device = device
+        
+        # Normalization (optional, for stability)
+        # Note: Paper does not mention normalization. This is an implementation choice.
+        # decay=0.99 provides ~100 step moving average (vs γ=0.9995 for ~2000 step WM EMA)
+        self.normalizer = RunningEMA(decay=0.99)
+        
+        # Statistics
+        self.total_calls = 0
+        self.total_progress = 0.0
+    
+    def compute(
+        self,
+        obs: np.ndarray,
+        action: int,
+        next_obs: np.ndarray,
+        reward: float,
+        done: bool,
+        teammate_actions: Optional[List[int]] = None
+    ) -> float:
+        """
+        Compute γ-Progress intrinsic reward for a single transition.
+        
+        Args:
+            obs: Current observation
+            action: Agent's action
+            next_obs: Next observation
+            reward: Environment reward
+            done: Episode termination flag
+            teammate_actions: Other agents' actions (for TeammatePredictor)
+        
+        Returns:
+            progress_reward: L(θ_old, x) - L(θ_new, x)
+        """
+        if self.world_model_ema is None:
+            # γ-Progress is disabled
+            return 0.0
+        
+        self.total_calls += 1
+        
+        # Prepare inputs
+        obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(self.device)
+        next_obs_t = torch.from_numpy(next_obs).float().unsqueeze(0).to(self.device)
+        action_t = torch.tensor([action], dtype=torch.long).to(self.device)
+        reward_t = torch.tensor([reward], dtype=torch.float32).to(self.device)
+        done_t = torch.tensor([done], dtype=torch.float32).to(self.device)
+        
+        if teammate_actions is not None:
+            teammate_actions_t = torch.tensor(
+                [teammate_actions], dtype=torch.long
+            ).to(self.device)
+        else:
+            teammate_actions_t = None
+        
+        with torch.no_grad():
+            # Compute loss with current World Model (θ_new)
+            loss_new = self._compute_world_model_loss(
+                self.world_model,
+                obs_t, action_t, next_obs_t, reward_t, done_t, teammate_actions_t
+            )
+            
+            # Compute loss with EMA World Model (θ_old)
+            loss_old = self._compute_world_model_loss(
+                self.world_model_ema,
+                obs_t, action_t, next_obs_t, reward_t, done_t, teammate_actions_t
+            )
+            
+            # γ-Progress: reward = loss_old - loss_new
+            # Positive when current model is better than old model (learning progress)
+            progress_reward = (loss_old - loss_new).item()
+        
+        # Normalize for stability (optional, not in paper)
+        if hasattr(self.config, 'gamma_progress_normalize') and self.config.gamma_progress_normalize:
+            progress_reward = self.normalizer.normalize(progress_reward)
+        
+        self.total_progress += progress_reward
+        
+        return progress_reward
+    
+    def _compute_world_model_loss(
+        self,
+        world_model,
+        obs_t: torch.Tensor,
+        action_t: torch.Tensor,
+        next_obs_t: torch.Tensor,
+        reward_t: torch.Tensor,
+        done_t: torch.Tensor,
+        teammate_actions_t: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Compute total World Model prediction loss for a single transition.
+        
+        This should match the loss components used in train_world_model_shared():
+        - Dynamics loss (KL divergence)
+        - Reward loss (Symlog two-hot cross-entropy)
+        - Continuation loss (BCE)
+        - Teammate loss (Cross-entropy, if applicable)
+        
+        Note: We exclude reconstruction loss here as it's computationally expensive
+        and dynamics/reward/continuation losses are sufficient for progress signal.
+        """
+        # Encode observations
+        z_dist = world_model.encoder(obs_t)
+        z = z_dist.rsample()  # (B, latent_dim)
+        
+        z_next_dist = world_model.encoder(next_obs_t)
+        z_next = z_next_dist.rsample()
+        
+        # Dynamics prediction
+        z_next_pred_dist = world_model.dynamics(z, action_t)
+        z_next_pred_logits = z_next_pred_dist.logits  # (B, latent_dim, num_categories)
+        z_next_logits_target = z_next_dist.logits.detach()
+        
+        # Dynamics loss (KL divergence with stop-gradient on target)
+        dynamics_loss = F.kl_div(
+            F.log_softmax(z_next_pred_logits.view(-1, world_model.encoder.num_categories), dim=-1),
+            F.softmax(z_next_logits_target.view(-1, world_model.encoder.num_categories), dim=-1),
+            reduction='batchmean'
+        )
+        dynamics_loss = torch.maximum(dynamics_loss, torch.tensor(self.config.free_nats).to(self.device))
+        
+        # Reward prediction
+        reward_pred = world_model.reward_predictor(z_next)
+        reward_loss = self._symlog_twohot_loss(reward_pred, reward_t)
+        
+        # Continuation prediction
+        continuation_pred = world_model.continuation_predictor(z_next)
+        continuation_loss = F.binary_cross_entropy_with_logits(
+            continuation_pred.squeeze(-1), 1.0 - done_t
+        )
+        
+        # Teammate prediction (if applicable)
+        teammate_loss = torch.tensor(0.0).to(self.device)
+        if teammate_actions_t is not None and world_model.teammate_predictor is not None:
+            teammate_pred = world_model.teammate_predictor(z.detach())  # stop-gradient on input
+            teammate_loss = F.cross_entropy(
+                teammate_pred.view(-1, teammate_pred.size(-1)),
+                teammate_actions_t.view(-1)
+            )
+        
+        # Total loss (weighted sum, matching train_world_model_shared)
+        total_loss = (
+            reward_loss +
+            continuation_loss +
+            teammate_loss +
+            self.config.kl_weight * dynamics_loss
+        )
+        
+        return total_loss
+    
+    def _symlog_twohot_loss(self, pred_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Symlog two-hot cross-entropy loss (matching MATWM paper Equation 6)
+        
+        Args:
+            pred_logits: (B, num_bins) logits
+            target: (B,) scalar rewards
+        
+        Returns:
+            loss: scalar
+        """
+        # Symlog transformation
+        target_symlog = torch.sign(target) * torch.log(1 + torch.abs(target))
+        
+        # Two-hot encoding
+        num_bins = pred_logits.size(-1)
+        bin_min, bin_max = -20.0, 20.0
+        bin_width = (bin_max - bin_min) / (num_bins - 1)
+        
+        # Clip to bin range
+        target_symlog = torch.clamp(target_symlog, bin_min, bin_max)
+        
+        # Find adjacent bins
+        bin_idx_float = (target_symlog - bin_min) / bin_width
+        bin_idx_low = torch.floor(bin_idx_float).long()
+        bin_idx_high = torch.ceil(bin_idx_float).long()
+        
+        # Weights for two-hot
+        weight_high = bin_idx_float - bin_idx_low.float()
+        weight_low = 1.0 - weight_high
+        
+        # Create two-hot target
+        target_twohot = torch.zeros_like(pred_logits)
+        target_twohot.scatter_(1, bin_idx_low.unsqueeze(1), weight_low.unsqueeze(1))
+        target_twohot.scatter_(1, bin_idx_high.unsqueeze(1), weight_high.unsqueeze(1))
+        
+        # Cross-entropy loss
+        loss = F.cross_entropy(pred_logits, target_twohot, reduction='mean')
+        
+        return loss
+    
+    def get_stats(self) -> Dict[str, float]:
+        """Return statistics for logging"""
+        if self.total_calls == 0:
+            return {"gamma_progress_avg": 0.0}
+        return {
+            "gamma_progress_avg": self.total_progress / self.total_calls,
+            "gamma_progress_total": self.total_progress,
+            "gamma_progress_calls": float(self.total_calls)
+        }
+    
+    def reset_stats(self):
+        """Reset statistics (call at episode end)"""
+        self.total_calls = 0
+        self.total_progress = 0.0
+
+
+# ====================================================================
 # 4. LLM 意味的好奇心
 # ====================================================================
 
@@ -801,6 +1062,10 @@ class CuriosityManager:
         agent_name: str,
         agent_idx: int,
         role: str,
+        matwm_config=None,  # MATWMConfig for γ-Progress
+        world_model=None,  # Current World Model (θ_new)
+        world_model_ema=None,  # EMA World Model (θ_old)
+        device=None,  # torch device
     ):
         self.config = config
         self.agent_name = agent_name
@@ -809,6 +1074,18 @@ class CuriosityManager:
 
         # 計算型好奇心
         self.curiosity = CuriosityReward(config, agent_name, agent_idx)
+
+        # γ-Progress 好奇心 (Kim et al. 2020)
+        self.gamma_progress = None
+        if (matwm_config is not None and 
+            hasattr(matwm_config, 'use_gamma_progress') and 
+            matwm_config.use_gamma_progress and
+            world_model is not None and
+            world_model_ema is not None and
+            device is not None):
+            self.gamma_progress = GammaProgressReward(
+                matwm_config, world_model, world_model_ema, device
+            )
 
         # LLM 意味的好奇心
         self.llm_evaluator = None
@@ -837,6 +1114,7 @@ class CuriosityManager:
         next_obs: np.ndarray,
         other_actions: Dict[str, int],
         device: torch.device,
+        done: bool = False,  # For γ-Progress
     ) -> float:
         """
         1ステップの内発的報酬を計算。
@@ -848,6 +1126,19 @@ class CuriosityManager:
         cur = self.curiosity.compute(
             world_model, obs, action, reward, next_obs, other_actions, device,
         )
+
+        # γ-Progress 好奇心 (Kim et al. 2020)
+        gamma_progress_reward = 0.0
+        if self.gamma_progress is not None:
+            # Convert other_actions dict to list for TeammatePredictor
+            teammate_actions = list(other_actions.values()) if other_actions else None
+            raw_progress = self.gamma_progress.compute(
+                obs, action, next_obs, reward, done, teammate_actions
+            )
+            # Apply weight from config
+            matwm_config = self.gamma_progress.config
+            weight = matwm_config.gamma_progress_weight if hasattr(matwm_config, 'gamma_progress_weight') else 0.5
+            gamma_progress_reward = weight * raw_progress
 
         # エピソードバッファに記録
         parsed = _parse_obs(obs, self.role)
@@ -862,10 +1153,11 @@ class CuriosityManager:
             "curiosity_reward": cur["reward_cur"],
             "curiosity_social": cur["social"],
             "curiosity_total": cur["total"],
+            "gamma_progress": gamma_progress_reward,  # NEW
         })
 
         # 意味的好奇心のボーナスを加算（LLM 評価結果が利用可能な場合）
-        total = cur["total"] + self._semantic_bonus
+        total = cur["total"] + self._semantic_bonus + gamma_progress_reward
 
         return total
 
@@ -909,6 +1201,10 @@ class CuriosityManager:
                         self.config.curiosity_initial_weight,
                         self.curiosity._current_weight * 1.1,
                     )
+        
+        # γ-Progress 統計のリセット
+        if self.gamma_progress is not None:
+            self.gamma_progress.reset_stats()
 
         return result
 
@@ -920,6 +1216,7 @@ class CuriosityManager:
         dynamics_vals = [s["curiosity_dynamics"] for s in self._episode_steps]
         social_vals = [s["curiosity_social"] for s in self._episode_steps]
         total_vals = [s["curiosity_total"] for s in self._episode_steps]
+        gamma_progress_vals = [s.get("gamma_progress", 0.0) for s in self._episode_steps]
 
         summary = {
             "curiosity_dynamics_mean": np.mean(dynamics_vals),
@@ -929,6 +1226,14 @@ class CuriosityManager:
             "curiosity_weight": self.curiosity._current_weight,
             "semantic_bonus": self._semantic_bonus,
         }
+        
+        # γ-Progress 統計
+        if self.gamma_progress is not None:
+            summary["gamma_progress_mean"] = np.mean(gamma_progress_vals)
+            summary["gamma_progress_sum"] = sum(gamma_progress_vals)
+            gamma_stats = self.gamma_progress.get_stats()
+            summary.update(gamma_stats)
+        
         if self._llm_result:
             summary["llm_novelty_score"] = self._llm_result.get("novelty_score", 0)
             summary["llm_social_novelty"] = self._llm_result.get("social_novelty", 0)
@@ -998,12 +1303,39 @@ class _LLMLogger:
 def create_curiosity_managers(
     agent_names: List[str],
     config: CuriosityConfig,
+    matwm_config=None,
+    world_model=None,
+    world_model_ema=None,
+    device=None,
 ) -> Dict[str, CuriosityManager]:
-    """全エージェント分の CuriosityManager を一括生成"""
+    """
+    全エージェント分の CuriosityManager を一括生成
+    
+    Args:
+        agent_names: エージェント名のリスト
+        config: CuriosityConfig
+        matwm_config: MATWMConfig (γ-Progress用、オプション)
+        world_model: Current World Model (γ-Progress用、オプション)
+        world_model_ema: EMA World Model (γ-Progress用、オプション)
+        device: torch device (γ-Progress用、オプション)
+    
+    Returns:
+        Dict[str, CuriosityManager]: エージェント名 → CuriosityManager
+    
+    Note:
+        γ-Progressを使用する場合は、matwm_config, world_model, world_model_ema, device
+        をすべて渡す必要があります。
+    """
     managers = {}
     for idx, name in enumerate(agent_names):
         role = "prey" if name.startswith("agent") else "adversary"
-        managers[name] = CuriosityManager(config, name, idx, role)
+        managers[name] = CuriosityManager(
+            config, name, idx, role,
+            matwm_config=matwm_config,
+            world_model=world_model,
+            world_model_ema=world_model_ema,
+            device=device,
+        )
     return managers
 
 
