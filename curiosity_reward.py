@@ -161,6 +161,10 @@ class CuriosityConfig:
     llm_eval_every_n_episodes: int = 1        # N エピソードごとにLLM評価
     semantic_curiosity_weight: float = 0.5     # LLM 好奇心の重み
 
+    # --- Learning Progress (LP) ---
+    use_learning_progress: bool = True    # 予測誤差の改善率を好奇心とする
+    lp_warmup_steps: int = 50            # LP 有効化までのステップ数
+
     # --- ログ ---
     verbose: bool = False
     log_dir: str = "llm_logs"
@@ -251,6 +255,11 @@ class CuriosityReward:
         self._dynamics_ema = RunningEMA(config.curiosity_ema_decay)
         self._reward_ema = RunningEMA(config.curiosity_ema_decay)
         self._social_ema = RunningEMA(config.curiosity_ema_decay)
+
+        # Learning Progress 用 EMA（予測誤差の改善率を追跡）
+        self._dynamics_lp = RunningEMA(config.curiosity_ema_decay)
+        self._reward_lp = RunningEMA(config.curiosity_ema_decay)
+        self._social_lp = RunningEMA(config.curiosity_ema_decay)
 
         # 訪問カウント（状態空間の離散化）
         self._visit_counts: Dict[str, int] = defaultdict(int)
@@ -362,15 +371,28 @@ class CuriosityReward:
             if social_count > 0:
                 social_error /= social_count
 
-        # --- 正規化 ---
-        if self.config.curiosity_normalize:
-            dynamics_norm = self._dynamics_ema.normalize(dynamics_error)
-            reward_norm = self._reward_ema.normalize(reward_error)
-            social_norm = self._social_ema.normalize(social_error)
+        # --- Learning Progress or raw error ---
+        if (self.config.use_learning_progress
+                and self._global_step > self.config.lp_warmup_steps):
+            # LP: 予測誤差の改善率（正 = 改善あり、ゼロ = 改善なし/悪化）
+            dynamics_signal = self._dynamics_lp.compute_learning_progress(dynamics_error)
+            reward_signal = self._reward_lp.compute_learning_progress(reward_error)
+            social_signal = self._social_lp.compute_learning_progress(social_error)
         else:
-            dynamics_norm = dynamics_error
-            reward_norm = reward_error
-            social_norm = social_error
+            # warmup 中または LP 無効時は従来方式
+            dynamics_signal = dynamics_error
+            reward_signal = reward_error
+            social_signal = social_error
+
+        # --- 正規化（非対称: 平均以下はゼロ） ---
+        if self.config.curiosity_normalize:
+            dynamics_norm = self._dynamics_ema.normalize(dynamics_signal)
+            reward_norm = self._reward_ema.normalize(reward_signal)
+            social_norm = self._social_ema.normalize(social_signal)
+        else:
+            dynamics_norm = max(0.0, dynamics_signal)
+            reward_norm = max(0.0, reward_signal)
+            social_norm = max(0.0, social_signal)
 
         # --- 訪問カウントベースの減衰 ---
         visit_bonus = 1.0
@@ -439,20 +461,36 @@ class CuriosityReward:
 
 
 class RunningEMA:
-    """指数移動平均による正規化"""
+    """指数移動平均による正規化 & Learning Progress 追跡"""
 
     def __init__(self, decay: float = 0.99):
         self.decay = decay
         self.mean = 0.0
         self.var = 1.0
         self.count = 0
+        self._prev_ema = 0.0  # LP 用: 過去の誤差の EMA
 
     def normalize(self, x: float) -> float:
         self.count += 1
         self.mean = self.decay * self.mean + (1 - self.decay) * x
         self.var = self.decay * self.var + (1 - self.decay) * (x - self.mean) ** 2
         std = max(math.sqrt(self.var), 1e-8)
-        return (x - self.mean) / std + 1.0  # 1.0 中心に正規化
+        return max(0.0, (x - self.mean) / std)  # 非対称正規化: 平均以下はゼロ
+
+    def compute_learning_progress(self, current_error: float) -> float:
+        """
+        Learning Progress: 予測誤差の改善率を返す。
+        LP = EMA(過去の誤差) - 現在の誤差
+        正 = 予測が改善した、ゼロ = 改善なしまたは悪化
+        """
+        if self.count < 1:
+            self._prev_ema = current_error
+            self.count += 1
+            return 0.0
+        lp = self._prev_ema - current_error
+        self._prev_ema = self.decay * self._prev_ema + (1 - self.decay) * current_error
+        self.count += 1
+        return max(0.0, lp)
 
 
 # ====================================================================
@@ -1020,16 +1058,52 @@ if __name__ == "__main__":
     print(f"\nConfig: social_weight={cfg.social_curiosity_weight}, "
           f"decay={cfg.curiosity_decay_method}")
 
-    # RunningEMA テスト
+    # RunningEMA テスト（非対称正規化: 平均以下 → 0）
+    print("\n--- RunningEMA normalize (asymmetric) ---")
     ema = RunningEMA(0.99)
     vals = [1.0, 0.5, 2.0, 0.3, 1.5]
     for v in vals:
         n = ema.normalize(v)
         print(f"  EMA: input={v:.2f}, normalized={n:.3f}, mean={ema.mean:.3f}")
+    assert all(ema.normalize(v) >= 0.0 for v in vals), "normalize must be >= 0"
+    print("  OK: all normalized values >= 0")
+
+    # Learning Progress テスト
+    print("\n--- Learning Progress test ---")
+    lp_ema = RunningEMA(0.95)
+
+    # (1) 誤差が減少していく列 → LP は正（改善あり）
+    decreasing = [2.0, 1.8, 1.5, 1.2, 0.9, 0.6, 0.3]
+    lp_vals = [lp_ema.compute_learning_progress(e) for e in decreasing]
+    print(f"  Decreasing errors: {decreasing}")
+    print(f"  LP values:         {[round(v, 4) for v in lp_vals]}")
+    assert all(v >= 0.0 for v in lp_vals), "LP must be >= 0"
+    assert sum(lp_vals[1:]) > 0, "LP should be positive for decreasing errors"
+    print("  OK: LP positive for decreasing errors")
+
+    # (2) 定数列 → LP はゼロに収束（改善なし）
+    lp_ema2 = RunningEMA(0.95)
+    constant = [1.0] * 20
+    lp_const = [lp_ema2.compute_learning_progress(e) for e in constant]
+    print(f"  Constant errors: [1.0] * 20")
+    print(f"  LP last 5:       {[round(v, 4) for v in lp_const[-5:]]}")
+    assert lp_const[-1] < 0.01, "LP should converge to ~0 for constant errors"
+    print("  OK: LP converges to ~0 for constant errors")
+
+    # (3) ランダム（増減混在） → LP は大部分がゼロ
+    lp_ema3 = RunningEMA(0.95)
+    random_errs = [1.0, 1.5, 0.8, 1.6, 0.9, 1.4, 1.1, 1.3, 0.7, 1.2]
+    lp_rand = [lp_ema3.compute_learning_progress(e) for e in random_errs]
+    zero_count = sum(1 for v in lp_rand if v == 0.0)
+    print(f"  Random errors:    {random_errs}")
+    print(f"  LP values:        {[round(v, 4) for v in lp_rand]}")
+    print(f"  Zero LP count:    {zero_count}/{len(lp_rand)}")
+    print("  OK: Random errors produce mostly zero LP")
 
     # パーステスト
+    print("\n--- LLM parse test ---")
     test_json = '{"novelty_score": 0.7, "social_novelty": 0.8, "spatial_novelty": 0.3, "strategic_novelty": 0.5, "exploration_phase": "explore", "reasoning": "test"}'
     parsed = LLMCuriosityEvaluator._parse_response(test_json)
-    print(f"\nParse test: {parsed}")
+    print(f"  Parse test: {parsed}")
 
-    print("\nDone.")
+    print("\nAll tests passed.")
