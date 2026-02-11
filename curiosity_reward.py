@@ -611,43 +611,53 @@ class GammaProgressReward:
         and dynamics/reward/continuation losses are sufficient for progress signal.
         """
         # Encode observations
-        z_dist = world_model.encoder(obs_t)
-        z = z_dist.rsample()  # (B, latent_dim)
-        
-        z_next_dist = world_model.encoder(next_obs_t)
-        z_next = z_next_dist.rsample()
+        z, z_logits = world_model.encode(obs_t)  # Returns (z_one_hot, logits)
+        z_next, z_next_logits = world_model.encode(next_obs_t)
         
         # Dynamics prediction
-        z_next_pred_dist = world_model.dynamics(z, action_t)
-        z_next_pred_logits = z_next_pred_dist.logits  # (B, latent_dim, num_categories)
-        z_next_logits_target = z_next_dist.logits.detach()
+        z_next_pred, z_next_pred_logits = world_model.predict_next(z.unsqueeze(1), action_t.unsqueeze(1))
+        z_next_pred = z_next_pred.squeeze(1)  # Remove sequence dimension
+        z_next_pred_logits = z_next_pred_logits.squeeze(1)
+        z_next_logits_target = z_next_logits.detach()
         
         # Dynamics loss (KL divergence with stop-gradient on target)
+        num_classes = world_model.config.num_classes
         dynamics_loss = F.kl_div(
-            F.log_softmax(z_next_pred_logits.view(-1, world_model.encoder.num_categories), dim=-1),
-            F.softmax(z_next_logits_target.view(-1, world_model.encoder.num_categories), dim=-1),
+            F.log_softmax(z_next_pred_logits.view(-1, num_classes), dim=-1),
+            F.softmax(z_next_logits_target.view(-1, num_classes), dim=-1),
             reduction='batchmean'
         )
         dynamics_loss = torch.maximum(dynamics_loss, torch.tensor(self.config.free_nats).to(self.device))
         
         # Reward prediction
-        reward_pred = world_model.reward_predictor(z_next)
+        reward_pred = world_model.predict_reward(z_next)
         reward_loss = self._symlog_twohot_loss(reward_pred, reward_t)
         
         # Continuation prediction
-        continuation_pred = world_model.continuation_predictor(z_next)
+        continuation_pred = world_model.predict_continuation(z_next)
+        # Ensure shapes match: continuation_pred might be (B,) or (B, 1)
+        continuation_pred_flat = continuation_pred.view(-1)
+        done_target = (1.0 - done_t).view(-1)
         continuation_loss = F.binary_cross_entropy_with_logits(
-            continuation_pred.squeeze(-1), 1.0 - done_t
+            continuation_pred_flat, done_target
         )
         
         # Teammate prediction (if applicable)
         teammate_loss = torch.tensor(0.0).to(self.device)
         if teammate_actions_t is not None and world_model.teammate_predictor is not None:
-            teammate_pred = world_model.teammate_predictor(z.detach())  # stop-gradient on input
-            teammate_loss = F.cross_entropy(
-                teammate_pred.view(-1, teammate_pred.size(-1)),
-                teammate_actions_t.view(-1)
-            )
+            # For γ-Progress, we use focal_agent_idx=0 as a representative
+            teammate_pred_dict = world_model.predict_teammates(z.unsqueeze(1).detach(), focal_agent_idx=0)
+            # teammate_pred_dict is {agent_idx: logits}
+            # We average the loss across all predicted teammates
+            for agent_idx, pred_logits in teammate_pred_dict.items():
+                if agent_idx < len(teammate_actions_t):
+                    target_action = teammate_actions_t[agent_idx].unsqueeze(0)  # (1,)
+                    teammate_loss += F.cross_entropy(
+                        pred_logits.squeeze(0).unsqueeze(0),  # (1, action_dim)
+                        target_action
+                    )
+            if len(teammate_pred_dict) > 0:
+                teammate_loss = teammate_loss / len(teammate_pred_dict)
         
         # Total loss (weighted sum, matching train_world_model_shared)
         total_loss = (
