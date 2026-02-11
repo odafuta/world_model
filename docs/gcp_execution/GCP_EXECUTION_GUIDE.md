@@ -1,4 +1,4 @@
-# GCP H100 実行ガイド - MATWM Training
+# GCP H100 実行ガイド - MATWM Training (Jupyter Notebook版)
 
 ## 📊 実行時間とコスト予想（H100使用時）
 
@@ -58,15 +58,19 @@ gsutil ls
 # プロジェクトディレクトリに移動
 cd "C:\Users\0622d\OneDrive - OUMail (Osaka University)\M1_秋冬\松尾研究室\WorldModel\最終課題"
 
-# 必要なファイルをアップロード
+# 必要なファイルをアップロード（Pythonファイル、Notebook、設定ファイル）
 gsutil -m cp *.py gs://matwm-training-bucket/
 gsutil cp requirements.txt gs://matwm-training-bucket/
 gsutil cp *.md gs://matwm-training-bucket/
+
+# 実験ディレクトリをアップロード
+gsutil -m rsync -r experiments/ gs://matwm-training-bucket/experiments/
 ```
 
 **アップロード完了を確認:**
 ```cmd
 gsutil ls gs://matwm-training-bucket/
+gsutil ls gs://matwm-training-bucket/experiments/
 ```
 
 出力例:
@@ -76,8 +80,10 @@ gs://matwm-training-bucket/matwm_agent.py
 gs://matwm-training-bucket/matwm_implementation.py
 gs://matwm-training-bucket/matwm_utils.py
 gs://matwm-training-bucket/requirements.txt
-gs://matwm-training-bucket/train_gamma_false.py
-gs://matwm-training-bucket/train_gamma_true.py
+gs://matwm-training-bucket/experiments/
+gs://matwm-training-bucket/experiments/llm_curiosity_and_γ-progress/
+gs://matwm-training-bucket/experiments/only_llm_curiosity/
+gs://matwm-training-bucket/experiments/only_γ_progress/
 ```
 
 ---
@@ -217,8 +223,12 @@ pwd
 gsutil -m cp gs://matwm-training-bucket/*.py .
 gsutil cp gs://matwm-training-bucket/requirements.txt .
 
+# 実験ディレクトリもダウンロード
+gsutil -m rsync -r gs://matwm-training-bucket/experiments/ experiments/
+
 # ダウンロード確認
 ls -lh
+ls -R experiments/
 ```
 
 **期待される出力:**
@@ -228,11 +238,29 @@ ls -lh
 -rw-r--r-- 1 user user  25K Feb 11 10:00 matwm_implementation.py
 -rw-r--r-- 1 user user  20K Feb 11 10:00 matwm_utils.py
 -rw-r--r-- 1 user user 500B Feb 11 10:00 requirements.txt
--rw-r--r-- 1 user user  25K Feb 11 10:00 train_gamma_false.py
--rw-r--r-- 1 user user  25K Feb 11 10:00 train_gamma_true.py
+drwxr-xr-x 5 user user 4.0K Feb 11 10:00 experiments/
+
+experiments/:
+llm_curiosity_and_γ-progress/
+only_llm_curiosity/
+only_γ_progress/
+README.md
 ```
 
-### 3-6. 依存パッケージのインストール
+### 3-6. Jupyter Notebookのインストール
+
+```bash
+# Jupyter関連パッケージをインストール
+pip install jupyter jupyterlab ipykernel
+
+# カーネルの登録
+python3 -m ipykernel install --user --name matwm --display-name "Python (MATWM)"
+
+# インストール確認
+jupyter --version
+```
+
+### 3-7. 依存パッケージのインストール
 
 ```bash
 # requirements.txtから一括インストール
@@ -251,7 +279,7 @@ pettingzoo        1.24.x
 torch             2.x.x
 ```
 
-### 3-7. 動作テスト
+### 3-8. 動作テスト
 
 ```bash
 # 簡単な動作確認
@@ -274,98 +302,133 @@ print(f'✓ GPU: {torch.cuda.get_device_name(0)}')
 
 ---
 
-## 🚀 ステップ4: トレーニングの実行（インスタンス1）
+## 🚀 ステップ4: Jupyter Notebookの実行
 
-### 4-1. tmuxセッションの開始
+### 4-1. JupyterLabの起動
 
 ```bash
 # tmuxセッションを開始（切断しても実行継続）
-tmux new -s matwm_true
+tmux new -s jupyter
+
+# JupyterLabを起動（ポート8888で起動）
+cd ~/matwm_project
+jupyter lab --no-browser --port=8888 --ip=0.0.0.0 --allow-root
 ```
 
-新しいtmuxセッションが開始されます。
+**出力例:**
+```
+[I 2026-02-11 10:00:00.000 ServerApp] Jupyter Server 2.x.x is running at:
+[I 2026-02-11 10:00:00.000 ServerApp] http://localhost:8888/lab?token=abcd1234...
+[I 2026-02-11 10:00:00.000 ServerApp]  or http://127.0.0.1:8888/lab?token=abcd1234...
+```
 
-### 4-2. トレーニング実行
+トークン（`token=...`）をコピーしておいてください。
+
+### 4-2. SSHポートフォワーディングの設定
+
+**ローカルPC（別のターミナル）で実行:**
+
+```cmd
+# GCP VMにSSHポートフォワーディングで接続
+gcloud compute ssh matwm-gamma-true-h100 \
+  --zone=us-central1-a \
+  -- -L 8888:localhost:8888
+```
+
+これで、ローカルPCのブラウザから `http://localhost:8888` でJupyterLabにアクセスできます。
+
+### 4-3. Notebookの実行
+
+1. ブラウザで `http://localhost:8888` を開く
+2. 先ほどコピーしたトークンを入力
+3. `experiments/` ディレクトリを開く
+4. 実行したい実験メソッドのディレクトリを選択：
+   - `llm_curiosity_and_γ-progress/` - LLM好奇心 + γ-Progress
+   - `only_llm_curiosity/` - LLM好奇心のみ
+   - `only_γ_progress/` - γ-Progressのみ
+5. Notebookファイル（`.ipynb`）を開く：
+   - フル実行版（50,000ステップ）: `2026_MATWM_simple_tag_Implementation_*.ipynb`
+   - テスト版（2,000ステップ）: `*_test.ipynb`
+6. カーネルを「Python (MATWM)」に設定
+7. セルを順番に実行（Shift + Enter）
+
+### 4-4. 出力ディレクトリの確認
+
+Notebookを実行すると、以下のディレクトリに結果が保存されます：
+
+```
+~/matwm_project/
+├── llm_logs/
+│   ├── llm_and_gamma/
+│   │   └── 20260211_100030/  # タイムスタンプ付き
+│   ├── only_llm/
+│   │   └── 20260211_110045/
+│   └── only_gamma/
+│       └── 20260211_120100/
+└── results/
+    ├── llm_and_gamma/
+    │   └── 20260211_100030/
+    │       ├── checkpoint_5000/
+    │       ├── checkpoint_10000/
+    │       └── training_curves.png
+    ├── only_llm/
+    └── only_gamma/
+```
+
+### 4-5. 実行の監視
 
 ```bash
-# 実行開始（ログ付き）
-cd ~/matwm_project
-python3 train_gamma_true.py 2>&1 | tee train_true_$(date +%Y%m%d_%H%M%S).log
+# 別のtmuxウィンドウを開く（Ctrl+B → C）
+# または別のSSHセッションで接続
+
+# ログディレクトリを監視
+watch -n 10 'ls -lRh llm_logs/'
+watch -n 10 'ls -lRh results/'
+
+# GPUの使用状況を監視
+watch -n 1 nvidia-smi
 ```
 
-**実行開始時の出力例:**
-```
-======================================================================
-MATWM + Curiosity-Driven Training (γ-Progress=TRUE)
-======================================================================
-use_gamma_progress: True
-Total steps: 50000
-Warmup steps: 5000
-Social curiosity weight: 2.0
-LLM enabled: False
-======================================================================
+### 4-6. tmuxセッションのデタッチ
 
-Save directory: ./results_gamma_true/run_20260211_100000
-
-Device: cuda
-  GPU: NVIDIA H100 80GB HBM3
-  VRAM: 81.6 GB
-
-Shared World Model: 11466783 params (γ-Progress enabled)
-
-=== Initializing Weights ===
-✓ Weight initialization complete
-
-=== Starting Training ===
-
-Training:   0%|          | 0/50000 [00:00<?, ?it/s]
-```
-
-### 4-3. tmuxセッションのデタッチ
-
-トレーニングが開始されたら、セッションから離脱します:
+JupyterLabが起動したら、必要に応じてセッションから離脱します:
 
 ```
 Ctrl+B を押してから D を押す
 ```
 
-元のターミナルに戻ります。SSH接続を切断してもトレーニングは継続されます。
+元のターミナルに戻ります。SSH接続を切断してもJupyterLabは継続されます。
 
 ---
 
-## 🚀 ステップ5: インスタンス2のセットアップと実行
+## 🚀 ステップ5: 複数実験の同時実行（オプション）
 
-### 5-1. SSH接続
+複数のGCP VMインスタンスで異なる実験を並列実行できます。
 
-別のブラウザタブで:
-1. GCPコンソール → **matwm-gamma-false-h100** の **SSH** をクリック
+### 5-1. 追加インスタンスの作成
 
-### 5-2. セットアップ（ステップ3と同じ）
+ステップ2と同様に、追加のVMインスタンスを作成します：
+- `matwm-only-llm-h100` (Only LLM Curiosity実験用)
+- `matwm-only-gamma-h100` (Only γ-Progress実験用)
 
-```bash
-# 作業ディレクトリ作成
-mkdir -p ~/matwm_project
-cd ~/matwm_project
+### 5-2. セットアップと実行
 
-# ファイルダウンロード
-gsutil -m cp gs://matwm-training-bucket/*.py .
-gsutil cp gs://matwm-training-bucket/requirements.txt .
+各インスタンスで、ステップ3-4を繰り返します：
+1. SSH接続
+2. 環境セットアップ
+3. JupyterLabの起動（異なるポートを使用、例: 8889, 8890）
+4. 対応する実験Notebookを実行
 
-# パッケージインストール
-pip install -r requirements.txt
-```
+**ポートフォワーディングの例（複数インスタンス）:**
+```cmd
+# インスタンス1（llm_and_gamma）
+gcloud compute ssh matwm-gamma-true-h100 --zone=us-central1-a -- -L 8888:localhost:8888
 
-### 5-3. トレーニング実行
+# インスタンス2（only_llm）
+gcloud compute ssh matwm-only-llm-h100 --zone=us-central1-a -- -L 8889:localhost:8889
 
-```bash
-# tmuxセッション開始
-tmux new -s matwm_false
-
-# 実行開始
-cd ~/matwm_project
-python3 train_gamma_false.py 2>&1 | tee train_false_$(date +%Y%m%d_%H%M%S).log
-
-# デタッチ: Ctrl+B → D
+# インスタンス3（only_gamma）
+gcloud compute ssh matwm-only-gamma-h100 --zone=us-central1-a -- -L 8890:localhost:8890
 ```
 
 ---
@@ -386,17 +449,20 @@ tmux attach -t matwm_true
 # デタッチ: Ctrl+B → D
 ```
 
-### 6-2. ログファイルの確認
+### 6-2. Jupyter Notebookの出力確認
+
+Notebookの各セルの出力をブラウザで直接確認できます。
+また、保存された結果ファイルも確認できます：
 
 ```bash
-# リアルタイムでログを表示
-cd ~/matwm_project
-tail -f train_true_*.log
+# LLMログの確認
+ls -lh llm_logs/*/
 
-# 最新100行を表示
-tail -n 100 train_true_*.log
+# 結果ディレクトリの確認
+ls -lRh results/*/
 
-# 停止: Ctrl+C
+# チェックポイントの確認
+find results/ -name "checkpoint_*" -type d
 ```
 
 ### 6-3. GPU使用状況の確認
@@ -437,12 +503,10 @@ Step 50000/50000 (100%完了) - 約12時間経過
 
 ### 7-1. トレーニング完了の確認
 
-```bash
-# tmuxセッションにアタッチ
-tmux attach -t matwm_true
-```
+Notebookの最終セルが実行完了すると、訓練が終了します。
+ブラウザでNotebookの出力を確認してください。
 
-**完了時の出力例:**
+**完了時の出力例（Notebook内）:**
 ```
 Training: 100%|██████████| 50000/50000 [12:15:32<00:00, 1.13it/s]
 
@@ -450,48 +514,59 @@ Training: 100%|██████████| 50000/50000 [12:15:32<00:00, 1.13
 Training Complete!
 ======================================================================
 Total episodes: 2000
-Final checkpoint: ./results_gamma_true/run_20260211_100000/final
-  adversary_0: mean reward = -12.34
-  adversary_1: mean reward = -11.23
-  adversary_2: mean reward = -10.45
-  agent_0: mean reward = 8.67
-
-======================================================================
-Curiosity Statistics
-======================================================================
-...
-
-✓ All results saved to: ./results_gamma_true/run_20260211_100000
+Final checkpoint saved
+Training curves saved to: results/llm_and_gamma/20260211_100030/training_curves.png
 ```
 
 ### 7-2. 結果をCloud Storageにアップロード
 
 ```bash
-# tmuxから抜ける（Ctrl+B → D）
-
-# 結果をGCSにアップロード
+# SSH接続して、結果をGCSにアップロード
 cd ~/matwm_project
-gsutil -m cp -r results_gamma_true gs://matwm-training-bucket/
-gsutil cp train_true_*.log gs://matwm-training-bucket/logs/
+
+# 全実験結果をアップロード
+gsutil -m rsync -r llm_logs/ gs://matwm-training-bucket/llm_logs/
+gsutil -m rsync -r results/ gs://matwm-training-bucket/results/
 
 # アップロード確認
-gsutil ls gs://matwm-training-bucket/results_gamma_true/
+gsutil ls -r gs://matwm-training-bucket/llm_logs/
+gsutil ls -r gs://matwm-training-bucket/results/
 ```
 
 ### 7-3. ローカルPCにダウンロード
 
-ローカルPC（Windows）で:
+ローカルPC（Windows PowerShell）で:
 
-```cmd
+```powershell
 cd "C:\Users\0622d\OneDrive - OUMail (Osaka University)\M1_秋冬\松尾研究室\WorldModel\最終課題"
 
-REM 結果ディレクトリを作成
-mkdir gcp_results
+# 結果ディレクトリを作成
+mkdir gcp_results -Force
 
-REM ダウンロード
-gsutil -m cp -r gs://matwm-training-bucket/results_gamma_true gcp_results\
-gsutil -m cp -r gs://matwm-training-bucket/results_gamma_false gcp_results\
-gsutil -m cp -r gs://matwm-training-bucket/logs gcp_results\
+# ダウンロード（全実験結果とLLMログ）
+gsutil -m rsync -r gs://matwm-training-bucket/llm_logs/ gcp_results/llm_logs/
+gsutil -m rsync -r gs://matwm-training-bucket/results/ gcp_results/results/
+
+# ダウンロード確認
+ls -R gcp_results
+```
+
+**ダウンロードされる構造:**
+```
+gcp_results/
+├── llm_logs/
+│   ├── llm_and_gamma/
+│   │   └── 20260211_100030/
+│   ├── only_llm/
+│   └── only_gamma/
+└── results/
+    ├── llm_and_gamma/
+    │   └── 20260211_100030/
+    │       ├── checkpoint_5000/
+    │       ├── checkpoint_10000/
+    │       └── training_curves.png
+    ├── only_llm/
+    └── only_gamma/
 ```
 
 ⏱️ **ダウンロード時間**: 約5-10分（結果ファイルのサイズによる）
