@@ -7,22 +7,16 @@ This directory contains different experimental configurations for MATWM training
 ```
 experiments/
 ├── llm_curiosity_and_γ-progress/  # LLM + γ-Progress
-│   ├── train_llm_and_gamma.py              (full training: 50000 steps)
-│   ├── train_llm_and_gamma_test.py         (test: 2000 steps)
-│   ├── 2026_MATWM_simple_tag_Implementation_gamma_true.ipynb
-│   └── 2026_MATWM_simple_tag_Implementation_gamma_true_test.ipynb
+│   ├── 2026_MATWM_simple_tag_Implementation_gamma_true.ipynb       (full training: 50000 steps)
+│   └── 2026_MATWM_simple_tag_Implementation_gamma_true_test.ipynb  (test: 2000 steps))
 │
 ├── only_llm_curiosity/            # Only LLM (γ-Progress disabled)
-│   ├── train_only_llm.py                    (full training: 50000 steps)
-│   ├── train_only_llm_test.py               (test: 2000 steps)
-│   ├── 2026_MATWM_simple_tag_Implementation_gamma_false.ipynb
-│   └── 2026_MATWM_simple_tag_Implementation_gamma_false_test.ipynb
+│   ├── 2026_MATWM_simple_tag_Implementation_gamma_false.ipynb      (full training: 50000 steps)
+│   └── 2026_MATWM_simple_tag_Implementation_gamma_false_test.ipynb (test: 2000 steps))
 │
 └── only_γ_progress/               # Only γ-Progress (LLM disabled)
-    ├── train_only_gamma.py                  (full training: 50000 steps)
-    ├── train_only_gamma_test.py             (test: 2000 steps)
-    ├── 2026_MATWM_simple_tag_Implementation_oly_gamma_true.ipynb
-    └── 2026_MATWM_simple_tag_Implementation_only_gamma_true_test.ipynb
+    ├── 2026_MATWM_simple_tag_Implementation_oly_gamma_true.ipynb       (full training: 50000 steps)
+    └── 2026_MATWM_simple_tag_Implementation_only_gamma_true_test.ipynb (test: 2000 steps)
 ```
 
 ## 🧪 Experiment Methods
@@ -100,41 +94,6 @@ jupyter lab
 - Set `OPENROUTER_API_KEY` environment variable before starting Jupyter
 - Or modify the `OPENROUTER_API_KEY` variable in the notebook cell
 
-### Method 2: Python Scripts (Legacy)
-
-### Test Version (Quick validation: 2000 steps)
-
-```bash
-# From project root
-cd "experiments/llm_curiosity_and_γ-progress"
-python train_llm_and_gamma_test.py
-
-cd "../only_llm_curiosity"
-python train_only_llm_test.py
-
-cd "../only_γ_progress"
-python train_only_gamma_test.py
-```
-
-### Full Training (50000 steps)
-
-```bash
-# Set API key (if using LLM)
-export OPENROUTER_API_KEY="sk-or-v1-..."  # Linux/Mac
-# or
-set OPENROUTER_API_KEY=sk-or-v1-...      # Windows
-
-# Run experiments
-cd "experiments/llm_curiosity_and_γ-progress"
-python train_llm_and_gamma.py
-
-cd "../only_llm_curiosity"
-python train_only_llm.py
-
-cd "../only_γ_progress"
-python train_only_gamma.py
-```
-
 ## 📊 Output Files
 
 Each run creates:
@@ -154,8 +113,6 @@ Each run creates:
    - Exploration phase recommendations
 
 ## 🔧 Configuration
-
-All experiments share the same base configuration from `train_base.py`:
 - Environment: PettingZoo simple_tag_v3
 - Agents: 4 (3 adversaries + 1 good agent)
 - Max cycles per episode: 25
