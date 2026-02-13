@@ -386,7 +386,7 @@ class MATWMAgent:
         # β₁ = kl_weight (0.5), β₂ = representation_weight (0.1)
         total_loss = (
             recon_loss +
-            reward_loss +
+            config.reward_weight * reward_loss +
             cont_loss +
             teammate_loss +
             config.kl_weight * dynamics_loss +
@@ -523,7 +523,7 @@ class MATWMAgent:
         # Total loss (Equation 3)
         total_loss = (
             recon_loss +
-            reward_loss +
+            self.config.reward_weight * reward_loss +
             cont_loss +
             teammate_loss +
             self.config.kl_weight * dynamics_loss +
