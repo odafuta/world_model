@@ -118,14 +118,14 @@ class MATWMConfig:
     # L(φ) = 1/(BT) Σ[L_rec + L_rew + L_con + L_team + β₁L_dyn + β₂L_rep]
     kl_weight: float = 0.5  # β₁: Dynamics loss weight (Table C.6)
     representation_weight: float = 0.1  # β₂: Representation loss weight (Table C.6)
+    reward_weight: float = 3.0  # Reward loss weight (paper default: 1.0, adjusted to 2.0-5.0 range)
     free_nats: float = 1.0  # Free bits for KL losses (Equation 9a, 9b)
-    
+
     # Note: In the paper's formulation (Equation 3), the following losses have implicit weight 1.0:
     # - L_rec (reconstruction)
-    # - L_rew (reward)
     # - L_con (continuation)
     # - L_team (teammate)
-    # These are NOT explicitly weighted in the paper, so we don't define separate weight parameters.
+    # We now explicitly control L_rew weight via reward_weight parameter.
     
     # Training Schedule (Table C.6)
     train_wm_every: int = 1  # Train world model every n steps
