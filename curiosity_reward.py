@@ -142,7 +142,7 @@ class CuriosityConfig:
     # fixed:    固定の減衰スケジュール (initial_weight → 0)
     # count:    訪問カウントベースの減衰
     # adaptive: World Model の学習進捗に連動
-    curiosity_initial_weight: float = 1.0      # 初期の好奇心重み
+    curiosity_initial_weight: float = 0.01      # 初期の好奇心重み
     curiosity_min_weight: float = 0.1          # 最小好奇心重み
     curiosity_decay_steps: int = 10000         # fixed: この歩数で min_weight に到達
 
