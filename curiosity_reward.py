@@ -149,8 +149,8 @@ class CuriosityConfig:
 
     # --- カリキュラム学習パラメータ ---
     curriculum_total_episodes: int = 1000      # 全エピソード数
-    curriculum_phase1_end: float = 0.3         # フェーズ1終了（全体の30%）
-    curriculum_phase2_end: float = 0.7         # フェーズ2終了（全体の70%）
+    curriculum_phase1_end: float = 0.4        # フェーズ1終了（全体の30%）
+    curriculum_phase2_end: float = 0.9         # フェーズ2終了（全体の70%）
     curriculum_phase1_weight: float = 0.0001   # フェーズ1の重み（勝ち負け重視）
     curriculum_phase2_weight: float = 0.005    # フェーズ2の重み（好奇心駆動）
     curriculum_phase3_weight: float = 0.0001   # フェーズ3の重み（勝ち負け重視）
@@ -435,7 +435,7 @@ class CuriosityReward:
         elif cfg.curiosity_decay_method == "adaptive":
             # World Model の予測精度に連動:
             # dynamics_error が小さい = WM が正確 → 好奇心を下げる
-            # dynamics_error が大きい = WM が不正確 → 好奇心を維持
+            # dynamics_error が大きい = WM が不正確 → 好奇心維持
             if self._dynamics_ema.count > 10:
                 # 正規化された誤差が 1.0 付近 = 平均的
                 # 1.0 より大きい = まだ学習が必要 → 好奇心維持
@@ -456,7 +456,7 @@ class CuriosityReward:
                 # フェーズ1: 序盤 - 勝ち負けにこだわって学習
                 self._current_weight = cfg.curriculum_phase1_weight
                 self.stats["curriculum_phase"] = 1
-            elif episode_progress < cfg.curriculum_phase2_end:
+            elif episode_progress < cfg.curriculum_phase1_end + cfg.curriculum_phase2_end:
                 # フェーズ2: 中盤 - 好奇心駆動で探索
                 # フェーズ1からフェーズ2への滑らかな遷移
                 phase_progress = (episode_progress - cfg.curriculum_phase1_end) / (cfg.curriculum_phase2_end - cfg.curriculum_phase1_end)
@@ -548,8 +548,8 @@ class GammaProgressReward:
         """
         Args:
             config: MATWMConfig with gamma_progress_weight
-            world_model: Current World Model (θ_new)
-            world_model_ema: EMA World Model (θ_old)
+            world_model: Current World Model parameters (θ_new)
+            world_model_ema: EMA World Model parameters (θ_old)
             device: torch device
         """
         self.config = config
