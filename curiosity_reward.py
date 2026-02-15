@@ -138,13 +138,22 @@ class CuriosityConfig:
     curiosity_ema_decay: float = 0.99          # 指数移動平均の減衰率
 
     # --- 好奇心の減衰 ---
-    curiosity_decay_method: str = "fixed"   # "fixed", "count", "adaptive"
-    # fixed:    固定の減衰スケジュール (initial_weight → 0)
-    # count:    訪問カウントベースの減衰
-    # adaptive: World Model の学習進捗に連動
+    curiosity_decay_method: str = "fixed"   # "fixed", "count", "adaptive", "curriculum"
+    # fixed:      固定の減衰スケジュール (initial_weight → 0)
+    # count:      訪問カウントベースの減衰
+    # adaptive:   World Model の学習進捗に連動
+    # curriculum: 3段階カリキュラム学習（序盤低→中盤高→終盤低）
     curiosity_initial_weight: float = 0.001      # 初期の好奇心重み
     curiosity_min_weight: float = 0.1          # 最小好奇心重み
     curiosity_decay_steps: int = 10000         # fixed: この歩数で min_weight に到達
+
+    # --- カリキュラム学習パラメータ ---
+    curriculum_total_episodes: int = 1000      # 全エピソード数
+    curriculum_phase1_end: float = 0.3         # フェーズ1終了（全体の30%）
+    curriculum_phase2_end: float = 0.7         # フェーズ2終了（全体の70%）
+    curriculum_phase1_weight: float = 0.0001   # フェーズ1の重み（勝ち負け重視）
+    curriculum_phase2_weight: float = 0.005    # フェーズ2の重み（好奇心駆動）
+    curriculum_phase3_weight: float = 0.0001   # フェーズ3の重み（勝ち負け重視）
 
     # --- 状態空間の離散化（訪問カウント用） ---
     state_bin_resolution: float = 0.2          # 状態の離散化解像度
@@ -258,6 +267,11 @@ class CuriosityReward:
         # 好奇心重みの現在値
         self._current_weight = config.curiosity_initial_weight
         self._global_step = 0
+        self._current_episode = 0  # カリキュラム学習用
+
+        # カリキュラム学習の初期重みを設定
+        if config.curiosity_decay_method == "curriculum":
+            self._current_weight = config.curriculum_phase1_weight
 
         # 統計
         self.stats = {
@@ -265,8 +279,9 @@ class CuriosityReward:
             "reward_mean": 0.0,
             "social_mean": 0.0,
             "total_mean": 0.0,
-            "weight": config.curiosity_initial_weight,
+            "weight": self._current_weight,
             "compute_count": 0,
+            "curriculum_phase": 1 if config.curiosity_decay_method == "curriculum" else 0,
         }
 
     def compute(
@@ -430,6 +445,37 @@ class CuriosityReward:
                 target = max(target, cfg.curiosity_min_weight)
                 # 緩やかに追従
                 self._current_weight = 0.995 * self._current_weight + 0.005 * target
+        elif cfg.curiosity_decay_method == "curriculum":
+            # 3段階カリキュラム学習
+            # フェーズ1（序盤）：勝ち負け重視 → 低い好奇心
+            # フェーズ2（中盤）：好奇心駆動 → 高い好奇心
+            # フェーズ3（終盤）：勝ち負け重視 → 低い好奇心
+            episode_progress = self._current_episode / max(1, cfg.curriculum_total_episodes)
+
+            if episode_progress < cfg.curriculum_phase1_end:
+                # フェーズ1: 序盤 - 勝ち負けにこだわって学習
+                self._current_weight = cfg.curriculum_phase1_weight
+                self.stats["curriculum_phase"] = 1
+            elif episode_progress < cfg.curriculum_phase2_end:
+                # フェーズ2: 中盤 - 好奇心駆動で探索
+                # フェーズ1からフェーズ2への滑らかな遷移
+                phase_progress = (episode_progress - cfg.curriculum_phase1_end) / (cfg.curriculum_phase2_end - cfg.curriculum_phase1_end)
+                if phase_progress < 0.2:  # 遷移期間（最初の20%）
+                    blend = phase_progress / 0.2
+                    self._current_weight = (1 - blend) * cfg.curriculum_phase1_weight + blend * cfg.curriculum_phase2_weight
+                else:
+                    self._current_weight = cfg.curriculum_phase2_weight
+                self.stats["curriculum_phase"] = 2
+            else:
+                # フェーズ3: 終盤 - 再び勝ち負けにこだわる
+                # フェーズ2からフェーズ3への滑らかな遷移
+                phase_progress = (episode_progress - cfg.curriculum_phase2_end) / (1.0 - cfg.curriculum_phase2_end)
+                if phase_progress < 0.2:  # 遷移期間（最初の20%）
+                    blend = phase_progress / 0.2
+                    self._current_weight = (1 - blend) * cfg.curriculum_phase2_weight + blend * cfg.curriculum_phase3_weight
+                else:
+                    self._current_weight = cfg.curriculum_phase3_weight
+                self.stats["curriculum_phase"] = 3
         # "count" は compute() 内で visit_bonus として処理済み
 
     def _discretize_state(self, obs: np.ndarray) -> str:
@@ -1114,6 +1160,8 @@ class CuriosityManager:
         """エピソード開始時にリセット"""
         self._episode_steps = []
         self._episode = episode
+        # カリキュラム学習用にエピソード番号を更新
+        self.curiosity._current_episode = episode
 
     def compute_intrinsic_reward(
         self,
@@ -1236,14 +1284,19 @@ class CuriosityManager:
             "curiosity_weight": self.curiosity._current_weight,
             "semantic_bonus": self._semantic_bonus,
         }
-        
+
+        # カリキュラム学習のフェーズ情報
+        if self.config.curiosity_decay_method == "curriculum":
+            summary["curriculum_phase"] = self.curiosity.stats.get("curriculum_phase", 0)
+            summary["curriculum_episode"] = self._episode
+
         # γ-Progress 統計
         if self.gamma_progress is not None:
             summary["gamma_progress_mean"] = np.mean(gamma_progress_vals)
             summary["gamma_progress_sum"] = sum(gamma_progress_vals)
             gamma_stats = self.gamma_progress.get_stats()
             summary.update(gamma_stats)
-        
+
         if self._llm_result:
             summary["llm_novelty_score"] = self._llm_result.get("novelty_score", 0)
             summary["llm_social_novelty"] = self._llm_result.get("social_novelty", 0)
@@ -1253,11 +1306,14 @@ class CuriosityManager:
 
     def print_stats(self):
         s = self.curiosity.stats
+        phase_info = ""
+        if self.config.curiosity_decay_method == "curriculum":
+            phase_info = f"  phase={s['curriculum_phase']}"
         print(f"[{self.agent_name}] Curiosity: "
               f"dynamics={s['dynamics_mean']:.4f}  "
               f"social={s['social_mean']:.4f}  "
               f"reward={s['reward_mean']:.4f}  "
-              f"weight={s['weight']:.4f}  "
+              f"weight={s['weight']:.4f}{phase_info}  "
               f"computed={s['compute_count']}")
         if self.llm_evaluator:
             self.llm_evaluator.print_stats()
