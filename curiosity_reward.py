@@ -128,7 +128,7 @@ class CuriosityConfig:
     # --- 計算型好奇心の重み ---
     dynamics_curiosity_weight: float = 1.0    # 状態予測誤差
     reward_curiosity_weight: float = 0.5      # 報酬予測誤差
-    social_curiosity_weight: float = 2.0      # チームメイト予測誤差 ★重め
+    social_curiosity_weight: float = 0.01      # チームメイト予測誤差 ★重め
     # Social Curiosity を重くする理由:
     #   非中央集権型では他エージェントの行動が最大の不確実性源。
     #   この不確実性を積極的に探索することが協調学習の加速に直結する。
@@ -138,11 +138,11 @@ class CuriosityConfig:
     curiosity_ema_decay: float = 0.99          # 指数移動平均の減衰率
 
     # --- 好奇心の減衰 ---
-    curiosity_decay_method: str = "adaptive"   # "fixed", "count", "adaptive"
+    curiosity_decay_method: str = "fixed"   # "fixed", "count", "adaptive"
     # fixed:    固定の減衰スケジュール (initial_weight → 0)
     # count:    訪問カウントベースの減衰
     # adaptive: World Model の学習進捗に連動
-    curiosity_initial_weight: float = 0.01      # 初期の好奇心重み
+    curiosity_initial_weight: float = 0.001      # 初期の好奇心重み
     curiosity_min_weight: float = 0.1          # 最小好奇心重み
     curiosity_decay_steps: int = 10000         # fixed: この歩数で min_weight に到達
 
