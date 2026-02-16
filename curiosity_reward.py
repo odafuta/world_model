@@ -149,8 +149,8 @@ class CuriosityConfig:
 
     # --- カリキュラム学習パラメータ ---
     curriculum_total_episodes: int = 1000      # 全エピソード数
-    curriculum_phase1_end: float = 0.4        # フェーズ1終了（全体の30%）
-    curriculum_phase2_end: float = 0.9         # フェーズ2終了（全体の70%）
+    curriculum_phase1_end: float = 1        # フェーズ1終了（全体の30%）
+    curriculum_phase2_end: float = 0        # フェーズ2終了（全体の70%）
     curriculum_phase1_weight: float = 0.0001   # フェーズ1の重み（勝ち負け重視）
     curriculum_phase2_weight: float = 0.005    # フェーズ2の重み（好奇心駆動）
     curriculum_phase3_weight: float = 0.0001   # フェーズ3の重み（勝ち負け重視）
