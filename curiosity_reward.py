@@ -128,7 +128,7 @@ class CuriosityConfig:
     # --- 計算型好奇心の重み ---
     dynamics_curiosity_weight: float = 1.0    # 状態予測誤差
     reward_curiosity_weight: float = 0.5      # 報酬予測誤差
-    social_curiosity_weight: float = 2.0      # チームメイト予測誤差 ★重め
+    social_curiosity_weight: float = 0.01      # チームメイト予測誤差 ★重め
     # Social Curiosity を重くする理由:
     #   非中央集権型では他エージェントの行動が最大の不確実性源。
     #   この不確実性を積極的に探索することが協調学習の加速に直結する。
@@ -138,13 +138,22 @@ class CuriosityConfig:
     curiosity_ema_decay: float = 0.99          # 指数移動平均の減衰率
 
     # --- 好奇心の減衰 ---
-    curiosity_decay_method: str = "adaptive"   # "fixed", "count", "adaptive"
-    # fixed:    固定の減衰スケジュール (initial_weight → 0)
-    # count:    訪問カウントベースの減衰
-    # adaptive: World Model の学習進捗に連動
-    curiosity_initial_weight: float = 1.0      # 初期の好奇心重み
+    curiosity_decay_method: str = "fixed"   # "fixed", "count", "adaptive", "curriculum"
+    # fixed:      固定の減衰スケジュール (initial_weight → 0)
+    # count:      訪問カウントベースの減衰
+    # adaptive:   World Model の学習進捗に連動
+    # curriculum: 3段階カリキュラム学習（序盤低→中盤高→終盤低）
+    curiosity_initial_weight: float = 0.001      # 初期の好奇心重み
     curiosity_min_weight: float = 0.1          # 最小好奇心重み
     curiosity_decay_steps: int = 10000         # fixed: この歩数で min_weight に到達
+
+    # --- カリキュラム学習パラメータ ---
+    curriculum_total_episodes: int = 1000      # 全エピソード数
+    curriculum_phase1_end: float = 1        # フェーズ1終了（全体の30%）
+    curriculum_phase2_end: float = 0        # フェーズ2終了（全体の70%）
+    curriculum_phase1_weight: float = 0.0001   # フェーズ1の重み（勝ち負け重視）
+    curriculum_phase2_weight: float = 0.005    # フェーズ2の重み（好奇心駆動）
+    curriculum_phase3_weight: float = 0.0001   # フェーズ3の重み（勝ち負け重視）
 
     # --- 状態空間の離散化（訪問カウント用） ---
     state_bin_resolution: float = 0.2          # 状態の離散化解像度
@@ -258,6 +267,11 @@ class CuriosityReward:
         # 好奇心重みの現在値
         self._current_weight = config.curiosity_initial_weight
         self._global_step = 0
+        self._current_episode = 0  # カリキュラム学習用
+
+        # カリキュラム学習の初期重みを設定
+        if config.curiosity_decay_method == "curriculum":
+            self._current_weight = config.curriculum_phase1_weight
 
         # 統計
         self.stats = {
@@ -265,8 +279,9 @@ class CuriosityReward:
             "reward_mean": 0.0,
             "social_mean": 0.0,
             "total_mean": 0.0,
-            "weight": config.curiosity_initial_weight,
+            "weight": self._current_weight,
             "compute_count": 0,
+            "curriculum_phase": 1 if config.curiosity_decay_method == "curriculum" else 0,
         }
 
     def compute(
@@ -420,7 +435,7 @@ class CuriosityReward:
         elif cfg.curiosity_decay_method == "adaptive":
             # World Model の予測精度に連動:
             # dynamics_error が小さい = WM が正確 → 好奇心を下げる
-            # dynamics_error が大きい = WM が不正確 → 好奇心を維持
+            # dynamics_error が大きい = WM が不正確 → 好奇心維持
             if self._dynamics_ema.count > 10:
                 # 正規化された誤差が 1.0 付近 = 平均的
                 # 1.0 より大きい = まだ学習が必要 → 好奇心維持
@@ -430,6 +445,37 @@ class CuriosityReward:
                 target = max(target, cfg.curiosity_min_weight)
                 # 緩やかに追従
                 self._current_weight = 0.995 * self._current_weight + 0.005 * target
+        elif cfg.curiosity_decay_method == "curriculum":
+            # 3段階カリキュラム学習
+            # フェーズ1（序盤）：勝ち負け重視 → 低い好奇心
+            # フェーズ2（中盤）：好奇心駆動 → 高い好奇心
+            # フェーズ3（終盤）：勝ち負け重視 → 低い好奇心
+            episode_progress = self._current_episode / max(1, cfg.curriculum_total_episodes)
+
+            if episode_progress < cfg.curriculum_phase1_end:
+                # フェーズ1: 序盤 - 勝ち負けにこだわって学習
+                self._current_weight = cfg.curriculum_phase1_weight
+                self.stats["curriculum_phase"] = 1
+            elif episode_progress < cfg.curriculum_phase1_end + cfg.curriculum_phase2_end:
+                # フェーズ2: 中盤 - 好奇心駆動で探索
+                # フェーズ1からフェーズ2への滑らかな遷移
+                phase_progress = (episode_progress - cfg.curriculum_phase1_end) / (cfg.curriculum_phase2_end - cfg.curriculum_phase1_end)
+                if phase_progress < 0.2:  # 遷移期間（最初の20%）
+                    blend = phase_progress / 0.2
+                    self._current_weight = (1 - blend) * cfg.curriculum_phase1_weight + blend * cfg.curriculum_phase2_weight
+                else:
+                    self._current_weight = cfg.curriculum_phase2_weight
+                self.stats["curriculum_phase"] = 2
+            else:
+                # フェーズ3: 終盤 - 再び勝ち負けにこだわる
+                # フェーズ2からフェーズ3への滑らかな遷移
+                phase_progress = (episode_progress - cfg.curriculum_phase2_end) / (1.0 - cfg.curriculum_phase2_end)
+                if phase_progress < 0.2:  # 遷移期間（最初の20%）
+                    blend = phase_progress / 0.2
+                    self._current_weight = (1 - blend) * cfg.curriculum_phase2_weight + blend * cfg.curriculum_phase3_weight
+                else:
+                    self._current_weight = cfg.curriculum_phase3_weight
+                self.stats["curriculum_phase"] = 3
         # "count" は compute() 内で visit_bonus として処理済み
 
     def _discretize_state(self, obs: np.ndarray) -> str:
@@ -453,6 +499,277 @@ class RunningEMA:
         self.var = self.decay * self.var + (1 - self.decay) * (x - self.mean) ** 2
         std = max(math.sqrt(self.var), 1e-8)
         return (x - self.mean) / std + 1.0  # 1.0 中心に正規化
+
+
+# ====================================================================
+# 3.5. γ-Progress 好奇心 (Kim et al. 2020)
+# ====================================================================
+
+class GammaProgressReward:
+    """
+    γ-Progress: Learning Progress-based Intrinsic Reward
+    
+    Reference: "Active World Model Learning with Progress Curiosity" (Kim et al. 2020)
+    
+    Concept:
+        r_progress = L(θ_old, x) - L(θ_new, x)
+        
+        where:
+        - θ_new: Current World Model parameters
+        - θ_old: EMA of past World Model parameters (θ_old ← γ·θ_old + (1-γ)·θ_new)
+        - L(θ, x): World Model prediction loss on experience x
+        
+    Key Insight:
+        Unlike standard curiosity (e.g., ICM, RND) that rewards prediction error,
+        γ-Progress rewards *learning progress* - the improvement in prediction accuracy.
+        
+        Benefits:
+        1. Overcomes "white noise problem": Random noise causes high prediction error
+           but no learning progress, so γ-Progress correctly assigns zero reward.
+        2. Focuses exploration on learnable complexity: Rewards states where the
+           World Model is actively improving its predictions.
+        3. Naturally decays: As the World Model converges, learning progress → 0,
+           automatically shifting from exploration to exploitation.
+    
+    Usage:
+        # In training loop (after World Model update):
+        gamma_progress = GammaProgressReward(config, world_model, world_model_ema, device)
+        intrinsic_reward = gamma_progress.compute(obs, action, next_obs, reward, done, teammate_actions)
+        total_reward = env_reward + config.gamma_progress_weight * intrinsic_reward
+    """
+    
+    def __init__(
+        self,
+        config,
+        world_model,
+        world_model_ema,
+        device: torch.device
+    ):
+        """
+        Args:
+            config: MATWMConfig with gamma_progress_weight
+            world_model: Current World Model parameters (θ_new)
+            world_model_ema: EMA World Model parameters (θ_old)
+            device: torch device
+        """
+        self.config = config
+        self.world_model = world_model
+        self.world_model_ema = world_model_ema
+        self.device = device
+        
+        # Normalization (optional, for stability)
+        # Note: Paper does not mention normalization. This is an implementation choice.
+        # decay=0.99 provides ~100 step moving average (vs γ=0.9995 for ~2000 step WM EMA)
+        self.normalizer = RunningEMA(decay=0.99)
+        
+        # Statistics
+        self.total_calls = 0
+        self.total_progress = 0.0
+    
+    def compute(
+        self,
+        obs: np.ndarray,
+        action: int,
+        next_obs: np.ndarray,
+        reward: float,
+        done: bool,
+        teammate_actions: Optional[List[int]] = None
+    ) -> float:
+        """
+        Compute γ-Progress intrinsic reward for a single transition.
+        
+        Args:
+            obs: Current observation
+            action: Agent's action
+            next_obs: Next observation
+            reward: Environment reward
+            done: Episode termination flag
+            teammate_actions: Other agents' actions (for TeammatePredictor)
+        
+        Returns:
+            progress_reward: L(θ_old, x) - L(θ_new, x)
+        """
+        if self.world_model_ema is None:
+            # γ-Progress is disabled
+            return 0.0
+        
+        self.total_calls += 1
+        
+        # Prepare inputs
+        obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(self.device)
+        next_obs_t = torch.from_numpy(next_obs).float().unsqueeze(0).to(self.device)
+        action_t = torch.tensor([action], dtype=torch.long).to(self.device)
+        reward_t = torch.tensor([reward], dtype=torch.float32).to(self.device)
+        done_t = torch.tensor([done], dtype=torch.float32).to(self.device)
+        
+        if teammate_actions is not None:
+            teammate_actions_t = torch.tensor(
+                [teammate_actions], dtype=torch.long
+            ).to(self.device)
+        else:
+            teammate_actions_t = None
+        
+        with torch.no_grad():
+            # Compute loss with current World Model (θ_new)
+            loss_new = self._compute_world_model_loss(
+                self.world_model,
+                obs_t, action_t, next_obs_t, reward_t, done_t, teammate_actions_t
+            )
+            
+            # Compute loss with EMA World Model (θ_old)
+            loss_old = self._compute_world_model_loss(
+                self.world_model_ema,
+                obs_t, action_t, next_obs_t, reward_t, done_t, teammate_actions_t
+            )
+            
+            # γ-Progress: reward = loss_old - loss_new
+            # Positive when current model is better than old model (learning progress)
+            progress_reward = (loss_old - loss_new).item()
+        
+        # Normalize for stability (optional, not in paper)
+        if hasattr(self.config, 'gamma_progress_normalize') and self.config.gamma_progress_normalize:
+            progress_reward = self.normalizer.normalize(progress_reward)
+        
+        self.total_progress += progress_reward
+        
+        return progress_reward
+    
+    def _compute_world_model_loss(
+        self,
+        world_model,
+        obs_t: torch.Tensor,
+        action_t: torch.Tensor,
+        next_obs_t: torch.Tensor,
+        reward_t: torch.Tensor,
+        done_t: torch.Tensor,
+        teammate_actions_t: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Compute total World Model prediction loss for a single transition.
+        
+        This should match the loss components used in train_world_model_shared():
+        - Dynamics loss (KL divergence)
+        - Reward loss (Symlog two-hot cross-entropy)
+        - Continuation loss (BCE)
+        - Teammate loss (Cross-entropy, if applicable)
+        
+        Note: We exclude reconstruction loss here as it's computationally expensive
+        and dynamics/reward/continuation losses are sufficient for progress signal.
+        """
+        # Encode observations
+        z, z_logits = world_model.encode(obs_t)  # Returns (z_one_hot, logits)
+        z_next, z_next_logits = world_model.encode(next_obs_t)
+        
+        # Dynamics prediction
+        z_next_pred, z_next_pred_logits = world_model.predict_next(z.unsqueeze(1), action_t.unsqueeze(1))
+        z_next_pred = z_next_pred.squeeze(1)  # Remove sequence dimension
+        z_next_pred_logits = z_next_pred_logits.squeeze(1)
+        z_next_logits_target = z_next_logits.detach()
+        
+        # Dynamics loss (KL divergence with stop-gradient on target)
+        num_classes = world_model.config.num_classes
+        dynamics_loss = F.kl_div(
+            F.log_softmax(z_next_pred_logits.view(-1, num_classes), dim=-1),
+            F.softmax(z_next_logits_target.view(-1, num_classes), dim=-1),
+            reduction='batchmean'
+        )
+        dynamics_loss = torch.maximum(dynamics_loss, torch.tensor(self.config.free_nats).to(self.device))
+        
+        # Reward prediction
+        reward_pred = world_model.predict_reward(z_next)
+        reward_loss = self._symlog_twohot_loss(reward_pred, reward_t)
+        
+        # Continuation prediction
+        continuation_pred = world_model.predict_continuation(z_next)
+        # Ensure shapes match: continuation_pred might be (B,) or (B, 1)
+        continuation_pred_flat = continuation_pred.view(-1)
+        done_target = (1.0 - done_t).view(-1)
+        continuation_loss = F.binary_cross_entropy_with_logits(
+            continuation_pred_flat, done_target
+        )
+        
+        # Teammate prediction (if applicable)
+        teammate_loss = torch.tensor(0.0).to(self.device)
+        if teammate_actions_t is not None and world_model.teammate_predictor is not None:
+            # For γ-Progress, we use focal_agent_idx=0 as a representative
+            teammate_pred_dict = world_model.predict_teammates(z.unsqueeze(1).detach(), focal_agent_idx=0)
+            # teammate_pred_dict is {agent_idx: logits}
+            # We average the loss across all predicted teammates
+            for agent_idx, pred_logits in teammate_pred_dict.items():
+                if agent_idx < len(teammate_actions_t):
+                    target_action = teammate_actions_t[agent_idx].unsqueeze(0)  # (1,)
+                    teammate_loss += F.cross_entropy(
+                        pred_logits.squeeze(0).unsqueeze(0),  # (1, action_dim)
+                        target_action
+                    )
+            if len(teammate_pred_dict) > 0:
+                teammate_loss = teammate_loss / len(teammate_pred_dict)
+        
+        # Total loss (weighted sum, matching train_world_model_shared)
+        total_loss = (
+            reward_loss +
+            continuation_loss +
+            teammate_loss +
+            self.config.kl_weight * dynamics_loss
+        )
+        
+        return total_loss
+    
+    def _symlog_twohot_loss(self, pred_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Symlog two-hot cross-entropy loss (matching MATWM paper Equation 6)
+        
+        Args:
+            pred_logits: (B, num_bins) logits
+            target: (B,) scalar rewards
+        
+        Returns:
+            loss: scalar
+        """
+        # Symlog transformation
+        target_symlog = torch.sign(target) * torch.log(1 + torch.abs(target))
+        
+        # Two-hot encoding
+        num_bins = pred_logits.size(-1)
+        bin_min, bin_max = -20.0, 20.0
+        bin_width = (bin_max - bin_min) / (num_bins - 1)
+        
+        # Clip to bin range
+        target_symlog = torch.clamp(target_symlog, bin_min, bin_max)
+        
+        # Find adjacent bins
+        bin_idx_float = (target_symlog - bin_min) / bin_width
+        bin_idx_low = torch.floor(bin_idx_float).long()
+        bin_idx_high = torch.ceil(bin_idx_float).long()
+        
+        # Weights for two-hot
+        weight_high = bin_idx_float - bin_idx_low.float()
+        weight_low = 1.0 - weight_high
+        
+        # Create two-hot target
+        target_twohot = torch.zeros_like(pred_logits)
+        target_twohot.scatter_(1, bin_idx_low.unsqueeze(1), weight_low.unsqueeze(1))
+        target_twohot.scatter_(1, bin_idx_high.unsqueeze(1), weight_high.unsqueeze(1))
+        
+        # Cross-entropy loss
+        loss = F.cross_entropy(pred_logits, target_twohot, reduction='mean')
+        
+        return loss
+    
+    def get_stats(self) -> Dict[str, float]:
+        """Return statistics for logging"""
+        if self.total_calls == 0:
+            return {"gamma_progress_avg": 0.0}
+        return {
+            "gamma_progress_avg": self.total_progress / self.total_calls,
+            "gamma_progress_total": self.total_progress,
+            "gamma_progress_calls": float(self.total_calls)
+        }
+    
+    def reset_stats(self):
+        """Reset statistics (call at episode end)"""
+        self.total_calls = 0
+        self.total_progress = 0.0
 
 
 # ====================================================================
@@ -801,6 +1118,10 @@ class CuriosityManager:
         agent_name: str,
         agent_idx: int,
         role: str,
+        matwm_config=None,  # MATWMConfig for γ-Progress
+        world_model=None,  # Current World Model (θ_new)
+        world_model_ema=None,  # EMA World Model (θ_old)
+        device=None,  # torch device
     ):
         self.config = config
         self.agent_name = agent_name
@@ -809,6 +1130,18 @@ class CuriosityManager:
 
         # 計算型好奇心
         self.curiosity = CuriosityReward(config, agent_name, agent_idx)
+
+        # γ-Progress 好奇心 (Kim et al. 2020)
+        self.gamma_progress = None
+        if (matwm_config is not None and 
+            hasattr(matwm_config, 'use_gamma_progress') and 
+            matwm_config.use_gamma_progress and
+            world_model is not None and
+            world_model_ema is not None and
+            device is not None):
+            self.gamma_progress = GammaProgressReward(
+                matwm_config, world_model, world_model_ema, device
+            )
 
         # LLM 意味的好奇心
         self.llm_evaluator = None
@@ -827,6 +1160,8 @@ class CuriosityManager:
         """エピソード開始時にリセット"""
         self._episode_steps = []
         self._episode = episode
+        # カリキュラム学習用にエピソード番号を更新
+        self.curiosity._current_episode = episode
 
     def compute_intrinsic_reward(
         self,
@@ -837,6 +1172,7 @@ class CuriosityManager:
         next_obs: np.ndarray,
         other_actions: Dict[str, int],
         device: torch.device,
+        done: bool = False,  # For γ-Progress
     ) -> float:
         """
         1ステップの内発的報酬を計算。
@@ -848,6 +1184,19 @@ class CuriosityManager:
         cur = self.curiosity.compute(
             world_model, obs, action, reward, next_obs, other_actions, device,
         )
+
+        # γ-Progress 好奇心 (Kim et al. 2020)
+        gamma_progress_reward = 0.0
+        if self.gamma_progress is not None:
+            # Convert other_actions dict to list for TeammatePredictor
+            teammate_actions = list(other_actions.values()) if other_actions else None
+            raw_progress = self.gamma_progress.compute(
+                obs, action, next_obs, reward, done, teammate_actions
+            )
+            # Apply weight from config
+            matwm_config = self.gamma_progress.config
+            weight = matwm_config.gamma_progress_weight if hasattr(matwm_config, 'gamma_progress_weight') else 0.5
+            gamma_progress_reward = weight * raw_progress
 
         # エピソードバッファに記録
         parsed = _parse_obs(obs, self.role)
@@ -862,10 +1211,11 @@ class CuriosityManager:
             "curiosity_reward": cur["reward_cur"],
             "curiosity_social": cur["social"],
             "curiosity_total": cur["total"],
+            "gamma_progress": gamma_progress_reward,  # NEW
         })
 
         # 意味的好奇心のボーナスを加算（LLM 評価結果が利用可能な場合）
-        total = cur["total"] + self._semantic_bonus
+        total = cur["total"] + self._semantic_bonus + gamma_progress_reward
 
         return total
 
@@ -909,6 +1259,10 @@ class CuriosityManager:
                         self.config.curiosity_initial_weight,
                         self.curiosity._current_weight * 1.1,
                     )
+        
+        # γ-Progress 統計のリセット
+        if self.gamma_progress is not None:
+            self.gamma_progress.reset_stats()
 
         return result
 
@@ -920,6 +1274,7 @@ class CuriosityManager:
         dynamics_vals = [s["curiosity_dynamics"] for s in self._episode_steps]
         social_vals = [s["curiosity_social"] for s in self._episode_steps]
         total_vals = [s["curiosity_total"] for s in self._episode_steps]
+        gamma_progress_vals = [s.get("gamma_progress", 0.0) for s in self._episode_steps]
 
         summary = {
             "curiosity_dynamics_mean": np.mean(dynamics_vals),
@@ -929,6 +1284,19 @@ class CuriosityManager:
             "curiosity_weight": self.curiosity._current_weight,
             "semantic_bonus": self._semantic_bonus,
         }
+
+        # カリキュラム学習のフェーズ情報
+        if self.config.curiosity_decay_method == "curriculum":
+            summary["curriculum_phase"] = self.curiosity.stats.get("curriculum_phase", 0)
+            summary["curriculum_episode"] = self._episode
+
+        # γ-Progress 統計
+        if self.gamma_progress is not None:
+            summary["gamma_progress_mean"] = np.mean(gamma_progress_vals)
+            summary["gamma_progress_sum"] = sum(gamma_progress_vals)
+            gamma_stats = self.gamma_progress.get_stats()
+            summary.update(gamma_stats)
+
         if self._llm_result:
             summary["llm_novelty_score"] = self._llm_result.get("novelty_score", 0)
             summary["llm_social_novelty"] = self._llm_result.get("social_novelty", 0)
@@ -938,11 +1306,14 @@ class CuriosityManager:
 
     def print_stats(self):
         s = self.curiosity.stats
+        phase_info = ""
+        if self.config.curiosity_decay_method == "curriculum":
+            phase_info = f"  phase={s['curriculum_phase']}"
         print(f"[{self.agent_name}] Curiosity: "
               f"dynamics={s['dynamics_mean']:.4f}  "
               f"social={s['social_mean']:.4f}  "
               f"reward={s['reward_mean']:.4f}  "
-              f"weight={s['weight']:.4f}  "
+              f"weight={s['weight']:.4f}{phase_info}  "
               f"computed={s['compute_count']}")
         if self.llm_evaluator:
             self.llm_evaluator.print_stats()
@@ -998,12 +1369,39 @@ class _LLMLogger:
 def create_curiosity_managers(
     agent_names: List[str],
     config: CuriosityConfig,
+    matwm_config=None,
+    world_model=None,
+    world_model_ema=None,
+    device=None,
 ) -> Dict[str, CuriosityManager]:
-    """全エージェント分の CuriosityManager を一括生成"""
+    """
+    全エージェント分の CuriosityManager を一括生成
+    
+    Args:
+        agent_names: エージェント名のリスト
+        config: CuriosityConfig
+        matwm_config: MATWMConfig (γ-Progress用、オプション)
+        world_model: Current World Model (γ-Progress用、オプション)
+        world_model_ema: EMA World Model (γ-Progress用、オプション)
+        device: torch device (γ-Progress用、オプション)
+    
+    Returns:
+        Dict[str, CuriosityManager]: エージェント名 → CuriosityManager
+    
+    Note:
+        γ-Progressを使用する場合は、matwm_config, world_model, world_model_ema, device
+        をすべて渡す必要があります。
+    """
     managers = {}
     for idx, name in enumerate(agent_names):
         role = "prey" if name.startswith("agent") else "adversary"
-        managers[name] = CuriosityManager(config, name, idx, role)
+        managers[name] = CuriosityManager(
+            config, name, idx, role,
+            matwm_config=matwm_config,
+            world_model=world_model,
+            world_model_ema=world_model_ema,
+            device=device,
+        )
     return managers
 
 

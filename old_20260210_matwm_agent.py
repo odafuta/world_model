@@ -55,16 +55,6 @@ class MATWMAgent:
             config.latent_dim, config.num_classes, config.critic_hidden_dim
         ).to(device)
         
-        # Critic EMA for regularization (Paper Equation 14)
-        # ψ_t+1^EMA = σψ_t^EMA + (1-σ)ψ_t
-        self.critic_ema = Critic(
-            config.latent_dim, config.num_classes, config.critic_hidden_dim
-        ).to(device)
-        self.critic_ema.load_state_dict(self.critic.state_dict())
-        # EMA parameters don't need gradients
-        for param in self.critic_ema.parameters():
-            param.requires_grad = False
-        
         # Optimizers (paper: WM=3e-5, Actor+Critic=3e-4)
         # World Model optimizer: only create if this agent owns the world model
         if self.owns_world_model:
@@ -150,60 +140,6 @@ class MATWMAgent:
             lr=config.wm_learning_rate
         )
         return world_model, wm_optimizer
-    
-    @staticmethod
-    def create_shared_world_model_with_ema(config, device):
-        """
-        Create shared world model with EMA for γ-Progress.
-        
-        Returns: (world_model, world_model_ema, optimizer)
-        
-        Usage:
-            if config.use_gamma_progress:
-                wm, wm_ema, opt = MATWMAgent.create_shared_world_model_with_ema(config, device)
-            else:
-                wm, opt = MATWMAgent.create_shared_world_model(config, device)
-                wm_ema = None
-        """
-        world_model = WorldModel(config, "shared").to(device)
-        wm_optimizer = torch.optim.Adam(
-            world_model.parameters(), 
-            lr=config.wm_learning_rate
-        )
-        
-        # EMA World Model for γ-Progress (θ_old)
-        world_model_ema = None
-        if config.use_gamma_progress:
-            world_model_ema = WorldModel(config, "shared_ema").to(device)
-            world_model_ema.load_state_dict(world_model.state_dict())
-            # EMA parameters don't need gradients
-            for param in world_model_ema.parameters():
-                param.requires_grad = False
-        
-        return world_model, world_model_ema, wm_optimizer
-    
-    @staticmethod
-    def update_shared_world_model_ema(world_model, world_model_ema, gamma):
-        """
-        Update shared World Model EMA (γ-Progress paper Equation 11)
-        θ_old ← γ·θ_old + (1-γ)·θ_new
-        
-        Args:
-            world_model: Current World Model (θ_new)
-            world_model_ema: EMA World Model (θ_old)
-            gamma: Decay rate (typically 0.9995)
-        """
-        if world_model_ema is None:
-            return
-        
-        with torch.no_grad():
-            for param_ema, param_new in zip(
-                world_model_ema.parameters(),
-                world_model.parameters()
-            ):
-                param_ema.data.mul_(gamma).add_(
-                    param_new.data, alpha=1.0 - gamma
-                )
     
     @staticmethod
     def train_world_model_shared(agents_dict, config, device, shared_wm_optimizer=None):
@@ -294,18 +230,18 @@ class MATWMAgent:
         z, z_logits = world_model.encode(obs_batch)
         z_next_target, z_next_logits_target = world_model.encode(next_obs_batch)
         
-        # ========================================================================
-        # World Model Loss Components (Paper Equation 3)
-        # L(φ) = 1/(BT) Σ[L_rec + L_rew + L_con + L_team + β₁(L_dyn) + β₂L_rep]
-        # ========================================================================
-        
-        # 1. Reconstruction loss (Equation 4): L_rec = (ô_t - o_t)²
+        # Reconstruction loss
         obs_recon = world_model.decode(z)
         recon_loss = F.mse_loss(obs_recon, obs_batch)
         
-        # 2. Reward loss (Equation 5): L_rew = L_sym(r̂_t, r_t)
-        # Predict reward from next latent state
+        # Dynamics loss
         z_next_pred, z_next_pred_logits = world_model.predict_next(z, scaled_action_batch)
+        dynamics_loss = F.cross_entropy(
+            z_next_pred_logits.reshape(-1, config.num_classes),
+            z_next_target.reshape(-1, config.num_classes).argmax(dim=-1)
+        )
+        
+        # Reward loss (two-hot symlog)
         reward_logits = world_model.predict_reward(z_next_pred)
         reward_symlog = symlog(reward_batch)
         reward_target = two_hot_encode(reward_symlog)
@@ -314,22 +250,22 @@ class MATWMAgent:
             reward_target.reshape(-1, 255).argmax(dim=-1)
         )
         
-        # 3. Continuation loss (Equation 6): L_con = c_t log ĉ_t + (1-c_t)log(1-ĉ_t)
+        # Continuation loss
         cont_logits = world_model.predict_continuation(z_next_pred)
         cont_target = 1.0 - done_batch
         cont_loss = F.binary_cross_entropy_with_logits(cont_logits, cont_target)
         
-        # 4. Teammate prediction loss (Equation 8): L_team = -ΣΣ δ(a_t,i=a) log p̂_t,i^(a)
-        # Paper (L140): "the latent state input to the teammate predictor is given as sg(z_0:T)"
+        # Teammate prediction loss
+        # ★ FIX: other_actions は {agent_name(str): action} 形式で保存されているが、
+        # predict_teammates は {agent_idx(int): logits} を返す。
+        # agent_name → agent_idx への変換が必要。
         teammate_loss = 0.0
         count = 0
         
         for seq_idx in range(len(all_sequences)):
             focal_agent_idx = agent_idx_batch[seq_idx].item()
-            # ★ FIXED: Apply stop-gradient to latent input (Paper L140)
-            z_detached = z[seq_idx:seq_idx+1].detach()
             teammate_logits_dict = world_model.predict_teammates(
-                z_detached, focal_agent_idx
+                z[seq_idx:seq_idx+1], focal_agent_idx
             )
             
             for t in range(config.wm_batch_length):
@@ -355,42 +291,22 @@ class MATWMAgent:
         else:
             teammate_loss = torch.tensor(0.0).to(device)
         
-        # 5. Dynamics loss (Equation 9a): L_dyn = max(1, KL[sg(q(z_t+1|o_t+1)) || g^D(ẑ_t+1|h_t)])
-        # Target: encoder distribution (with stop-gradient)
-        # Prediction: dynamics model distribution
-        z_next_target_dist = F.softmax(z_next_logits_target.detach(), dim=-1)
-        z_next_pred_dist = F.softmax(z_next_pred_logits, dim=-1)
-        
-        dynamics_loss = F.kl_div(
-            F.log_softmax(z_next_pred_logits.reshape(-1, config.num_classes), dim=-1),
-            z_next_target_dist.reshape(-1, config.num_classes),
+        # KL divergence with free nats
+        kl_loss = F.kl_div(
+            F.log_softmax(z_logits.reshape(-1, config.num_classes), dim=-1),
+            F.softmax(z_next_logits_target.reshape(-1, config.num_classes), dim=-1),
             reduction='batchmean'
         )
-        dynamics_loss = torch.maximum(dynamics_loss, torch.tensor(config.free_nats).to(device))
+        kl_loss = torch.maximum(kl_loss, torch.tensor(config.free_nats).to(device))
         
-        # 6. Representation loss (Equation 9b): L_rep = max(1, KL[q(z_t+1|o_t+1) || sg(g^D(ẑ_t+1|h_t))])
-        # Target: encoder distribution (no stop-gradient)
-        # Prediction: dynamics model distribution (with stop-gradient)
-        z_next_target_dist_no_sg = F.softmax(z_next_logits_target, dim=-1)
-        z_next_pred_dist_sg = F.softmax(z_next_pred_logits.detach(), dim=-1)
-        
-        representation_loss = F.kl_div(
-            F.log_softmax(z_next_logits_target.reshape(-1, config.num_classes), dim=-1),
-            z_next_pred_dist_sg.reshape(-1, config.num_classes),
-            reduction='batchmean'
-        )
-        representation_loss = torch.maximum(representation_loss, torch.tensor(config.free_nats).to(device))
-        
-        # Total loss (Equation 3)
-        # L(φ) = 1/(BT) Σ[L_rec + L_rew + L_con + L_team + β₁L_dyn + β₂L_rep]
-        # β₁ = kl_weight (0.5), β₂ = representation_weight (0.1)
+        # Total loss
         total_loss = (
-            recon_loss +
+            config.recon_weight * recon_loss +
+            config.dynamics_weight * dynamics_loss +
             config.reward_weight * reward_loss +
-            cont_loss +
-            teammate_loss +
-            config.kl_weight * dynamics_loss +
-            config.representation_weight * representation_loss
+            config.continuation_weight * cont_loss +
+            config.teammate_weight * teammate_loss +
+            config.kl_weight * kl_loss
         )
         
         # Update shared world model once
@@ -402,11 +318,11 @@ class MATWMAgent:
         return {
             'wm_total_loss': total_loss.item(),
             'wm_recon_loss': recon_loss.item(),
+            'wm_dynamics_loss': dynamics_loss.item(),
             'wm_reward_loss': reward_loss.item(),
             'wm_cont_loss': cont_loss.item(),
             'wm_teammate_loss': teammate_loss.item() if isinstance(teammate_loss, torch.Tensor) else teammate_loss,
-            'wm_dynamics_loss': dynamics_loss.item(),
-            'wm_representation_loss': representation_loss.item(),
+            'wm_kl_loss': kl_loss.item(),
         }
     
     def _train_world_model_on_sequences(self, sequences):
@@ -447,17 +363,18 @@ class MATWMAgent:
         z, z_logits = self.world_model.encode(obs_batch)
         z_next_target, z_next_logits_target = self.world_model.encode(next_obs_batch)
         
-        # ========================================================================
-        # World Model Loss Components (Paper Equation 3)
-        # L(φ) = 1/(BT) Σ[L_rec + L_rew + L_con + L_team + β₁L_dyn + β₂L_rep]
-        # ========================================================================
-        
-        # 1. Reconstruction loss (Equation 4): L_rec = (ô_t - o_t)²
+        # Reconstruction loss
         obs_recon = self.world_model.decode(z)
         recon_loss = F.mse_loss(obs_recon, obs_batch)
         
-        # 2. Reward loss (Equation 5): L_rew = L_sym(r̂_t, r_t)
+        # Dynamics loss
         z_next_pred, z_next_pred_logits = self.world_model.predict_next(z, scaled_action_batch)
+        dynamics_loss = F.cross_entropy(
+            z_next_pred_logits.reshape(-1, self.config.num_classes),
+            z_next_target.reshape(-1, self.config.num_classes).argmax(dim=-1)
+        )
+        
+        # Reward loss (two-hot symlog)
         reward_logits = self.world_model.predict_reward(z_next_pred)
         reward_symlog = symlog(reward_batch)
         reward_target = two_hot_encode(reward_symlog)
@@ -466,15 +383,14 @@ class MATWMAgent:
             reward_target.reshape(-1, 255).argmax(dim=-1)
         )
         
-        # 3. Continuation loss (Equation 6): L_con = c_t log ĉ_t + (1-c_t)log(1-ĉ_t)
+        # Continuation loss
         cont_logits = self.world_model.predict_continuation(z_next_pred)
         cont_target = 1.0 - done_batch
         cont_loss = F.binary_cross_entropy_with_logits(cont_logits, cont_target)
         
-        # 4. Teammate prediction loss (Equation 8): L_team = -ΣΣ δ(a_t,i=a) log p̂_t,i^(a)
-        # Paper (L140): Apply stop-gradient to latent input
-        z_detached = z.detach()
-        teammate_logits_dict = self.world_model.predict_teammates(z_detached, self.agent_idx)
+        # Teammate prediction loss
+        # ★ FIX: agent_name(str) → agent_idx(int) 変換
+        teammate_logits_dict = self.world_model.predict_teammates(z, self.agent_idx)
         teammate_loss = 0.0
         count = 0
         
@@ -502,32 +418,22 @@ class MATWMAgent:
         else:
             teammate_loss = torch.tensor(0.0).to(self.device)
         
-        # 5. Dynamics loss (Equation 9a): L_dyn = max(1, KL[sg(q(z_t+1|o_t+1)) || g^D(ẑ_t+1|h_t)])
-        z_next_target_dist = F.softmax(z_next_logits_target.detach(), dim=-1)
-        dynamics_loss = F.kl_div(
-            F.log_softmax(z_next_pred_logits.reshape(-1, self.config.num_classes), dim=-1),
-            z_next_target_dist.reshape(-1, self.config.num_classes),
+        # KL divergence with free nats
+        kl_loss = F.kl_div(
+            F.log_softmax(z_logits.reshape(-1, self.config.num_classes), dim=-1),
+            F.softmax(z_next_logits_target.reshape(-1, self.config.num_classes), dim=-1),
             reduction='batchmean'
         )
-        dynamics_loss = torch.maximum(dynamics_loss, torch.tensor(self.config.free_nats).to(self.device))
+        kl_loss = torch.maximum(kl_loss, torch.tensor(self.config.free_nats).to(self.device))
         
-        # 6. Representation loss (Equation 9b): L_rep = max(1, KL[q(z_t+1|o_t+1) || sg(g^D(ẑ_t+1|h_t))])
-        z_next_pred_dist_sg = F.softmax(z_next_pred_logits.detach(), dim=-1)
-        representation_loss = F.kl_div(
-            F.log_softmax(z_next_logits_target.reshape(-1, self.config.num_classes), dim=-1),
-            z_next_pred_dist_sg.reshape(-1, self.config.num_classes),
-            reduction='batchmean'
-        )
-        representation_loss = torch.maximum(representation_loss, torch.tensor(self.config.free_nats).to(self.device))
-        
-        # Total loss (Equation 3)
+        # Total loss
         total_loss = (
-            recon_loss +
+            self.config.recon_weight * recon_loss +
+            self.config.dynamics_weight * dynamics_loss +
             self.config.reward_weight * reward_loss +
-            cont_loss +
-            teammate_loss +
-            self.config.kl_weight * dynamics_loss +
-            self.config.representation_weight * representation_loss
+            self.config.continuation_weight * cont_loss +
+            self.config.teammate_weight * teammate_loss +
+            self.config.kl_weight * kl_loss
         )
         
         # Update
@@ -539,11 +445,11 @@ class MATWMAgent:
         return {
             'wm_total_loss': total_loss.item(),
             'wm_recon_loss': recon_loss.item(),
+            'wm_dynamics_loss': dynamics_loss.item(),
             'wm_reward_loss': reward_loss.item(),
             'wm_cont_loss': cont_loss.item(),
             'wm_teammate_loss': teammate_loss.item() if isinstance(teammate_loss, torch.Tensor) else teammate_loss,
-            'wm_dynamics_loss': dynamics_loss.item(),
-            'wm_representation_loss': representation_loss.item(),
+            'wm_kl_loss': kl_loss.item(),
         }
     
     def train_agent(self):
@@ -636,47 +542,26 @@ class MATWMAgent:
             advantages.insert(0, gae)
         advantages = torch.stack(advantages, dim=1)
         
-        # ========================================================================
-        # Actor-Critic Loss (Paper Equations 11-14)
-        # ========================================================================
+        # ★ FIX: advantages を正規化（学習安定化）
+        adv_mean = advantages.mean()
+        adv_std = advantages.std() + 1e-8
+        advantages_norm = (advantages - adv_mean) / adv_std
         
-        # Compute λ-return (Paper Equation 12)
-        # G_t^λ = r_t + γc_t[(1-λ)V(s_t+1) + λG_t+1^λ]
-        # We use GAE which is equivalent to computing advantages and adding values
-        lambda_returns = advantages + torch.stack(value_trajectory, dim=1)
+        # Returns
+        returns = advantages + torch.stack(value_trajectory, dim=1)
+        # ★ FIX: returns をクリップ（Critic の発散防止）
+        returns = torch.clamp(returns, -100.0, 100.0)
         
-        # Actor loss (Paper Equation 11, first part)
-        # L(θ) = -sg((G_t^λ - V)/max(1,S)) ln π - η H(π)
-        # Paper uses percentile normalization: S = percentile(G, 95) - percentile(G, 5)
+        # Actor loss (policy gradient + entropy bonus)
         action_log_probs = torch.stack(action_log_prob_trajectory, dim=1)
         entropies = torch.stack(entropy_trajectory, dim=1)
+        entropy_coef = 0.01  # ★ エントロピーボーナス係数
+        actor_loss = -(action_log_probs * advantages_norm.detach()).mean() - entropy_coef * entropies.mean()
         
-        # Percentile-based normalization (Paper Equation 13)
-        lambda_returns_flat = lambda_returns.reshape(-1)
-        percentile_95 = torch.quantile(lambda_returns_flat, 0.95)
-        percentile_5 = torch.quantile(lambda_returns_flat, 0.05)
-        S = torch.maximum(torch.tensor(1.0).to(self.device), percentile_95 - percentile_5)
-        
-        # Normalized advantages
-        values_stacked = torch.stack(value_trajectory, dim=1)
-        advantages_normalized = (lambda_returns - values_stacked) / S
-        
-        # Actor loss: policy gradient + entropy bonus
-        actor_loss = -(action_log_probs * advantages_normalized.detach()).mean() \
-                     - self.config.entropy_coef * entropies.mean()
-        
-        # Critic loss (Paper Equation 11, second part)
-        # L(ψ) = (V - sg(G_t^λ))² + (V - sg(V_EMA))²
-        # Get EMA critic values
-        with torch.no_grad():
-            # Reconstruct z_trajectory for EMA critic
-            z_traj_stacked = torch.stack(z_trajectory[:-1], dim=1)  # Exclude final state
-            values_ema = self.critic_ema(z_traj_stacked)
-        
-        # Two components of critic loss
-        critic_loss_lambda = F.mse_loss(values_stacked, lambda_returns.detach())
-        critic_loss_ema = F.mse_loss(values_stacked, values_ema.detach())
-        critic_loss = critic_loss_lambda + critic_loss_ema
+        # ★ FIX: Critic loss を Huber loss に変更（スパイク防止）
+        critic_loss = F.smooth_l1_loss(
+            torch.stack(value_trajectory, dim=1), returns.detach()
+        )
         
         # Update actor
         self.actor_optimizer.zero_grad()
@@ -690,23 +575,13 @@ class MATWMAgent:
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.config.gradient_clip_agent)
         self.critic_optimizer.step()
         
-        # Update EMA critic (Paper Equation 14)
-        # ψ_t+1^EMA = σψ_t^EMA + (1-σ)ψ_t
-        with torch.no_grad():
-            for ema_param, param in zip(self.critic_ema.parameters(), self.critic.parameters()):
-                ema_param.data.mul_(self.config.critic_ema_decay).add_(
-                    param.data, alpha=1.0 - self.config.critic_ema_decay
-                )
-        
         return {
             'actor_loss': actor_loss.item(),
             'critic_loss': critic_loss.item(),
-            'critic_loss_lambda': critic_loss_lambda.item(),
-            'critic_loss_ema': critic_loss_ema.item(),
             'mean_imagined_reward': rewards.mean().item(),
             'mean_value': values.mean().item(),
             'mean_entropy': entropies.mean().item(),       # ★ 新メトリクス
-            'normalization_S': S.item(),
+            'mean_advantage': advantages.mean().item(),     # ★ 新メトリクス
         }
     
     def save(self, path):
@@ -719,7 +594,6 @@ class MATWMAgent:
         checkpoint = {
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict(),
-            'critic_ema': self.critic_ema.state_dict(),
             'actor_optimizer': self.actor_optimizer.state_dict(),
             'critic_optimizer': self.critic_optimizer.state_dict(),
         }
@@ -741,8 +615,6 @@ class MATWMAgent:
         checkpoint = torch.load(path, map_location=self.device)
         self.actor.load_state_dict(checkpoint['actor'])
         self.critic.load_state_dict(checkpoint['critic'])
-        if 'critic_ema' in checkpoint:
-            self.critic_ema.load_state_dict(checkpoint['critic_ema'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
         

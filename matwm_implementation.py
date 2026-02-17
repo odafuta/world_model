@@ -95,10 +95,18 @@ class MATWMConfig:
     gradient_clip_wm: float = 1000.0  # Gradient clipping world model
     gradient_clip_agent: float = 10.0  # ★ FIX: 100→10 (Critic スパイク防止)
     
-    # RL Parameters
+    # RL Parameters (Paper Equations 11-14)
     gamma: float = 0.99  # Discount factor
-    lambda_gae: float = 0.95  # GAE lambda
-    entropy_coef: float = 0.01  # ★ NEW: エントロピーボーナス係数（探索促進）
+    lambda_gae: float = 0.95  # GAE lambda (for λ-return computation, Eq. 12) 論文内に明示されていないが、DreamerV3のデフォルト値で設定してみる
+    entropy_coef: float = 0.01  # ★ NEW: エントロピーボーナス係数（探索促進） # Entropy regularization coefficient η (Eq. 11)
+    critic_ema_decay: float = 0.98  # EMA decay rate σ for critic regularization (Eq. 14) 論文内に明示されていないが、DreamerV3のデフォルト値で設定してみる
+    
+    # γ-Progress Parameters (Active World Model Learning paper, Kim et al. 2020)
+    # For ablation study: set use_gamma_progress=False to disable
+    use_gamma_progress: bool = False  # Enable γ-Progress curiosity (default: False for baseline)
+    gamma_progress: float = 0.9995  # EMA decay rate for θ_old (Equation 11, paper value)
+    gamma_progress_weight: float = 1.0  # Weight for γ-Progress intrinsic reward (paper uses no explicit weight, i.e., 1.0)
+    gamma_progress_normalize: bool = True  # Normalize γ-Progress reward (not in paper, for stability)
     
     # Replay Buffer (Table C.6)
     buffer_size: int = 50000  # Replay buffer size (will be adjusted in __post_init__)
@@ -106,17 +114,18 @@ class MATWMConfig:
     priority_decay: float = 0.9998  # Replay sampling priority decay (paper value)
     # Note: 0.9998 is very gradual. For faster adaptation: 0.995-0.997
     
-    # Loss Weights (Table C.6)
-    kl_weight: float = 0.5  # KL loss weight (β₁)
-    representation_weight: float = 0.1  # Representation loss weight (β₂)
-    free_nats: float = 1.0  # Free bits for KL loss
-    
-    # Additional Loss Weights (not in paper, using defaults)
-    recon_weight: float = 1.0
-    dynamics_weight: float = 1.0
-    reward_weight: float = 1.0
-    continuation_weight: float = 1.0
-    teammate_weight: float = 0.5
+    # Loss Weights (Paper Equation 3, Table C.6)
+    # L(φ) = 1/(BT) Σ[L_rec + L_rew + L_con + L_team + β₁L_dyn + β₂L_rep]
+    kl_weight: float = 0.5  # β₁: Dynamics loss weight (Table C.6)
+    representation_weight: float = 0.1  # β₂: Representation loss weight (Table C.6)
+    reward_weight: float = 3.0  # Reward loss weight (paper default: 1.0, adjusted to 2.0-5.0 range)
+    free_nats: float = 1.0  # Free bits for KL losses (Equation 9a, 9b)
+
+    # Note: In the paper's formulation (Equation 3), the following losses have implicit weight 1.0:
+    # - L_rec (reconstruction)
+    # - L_con (continuation)
+    # - L_team (teammate)
+    # We now explicitly control L_rew weight via reward_weight parameter.
     
     # Training Schedule (Table C.6)
     train_wm_every: int = 1  # Train world model every n steps
@@ -223,7 +232,7 @@ def pad_observation(obs, target_dim):
 class PrioritizedReplayBuffer:
     """Prioritized Replay Buffer that emphasizes recent experiences"""
     
-    def __init__(self, capacity, priority_decay=0.995):
+    def __init__(self, capacity, priority_decay=0.9998): # priority_decay: float = 0.9998の値を論文では0.9998だが、これは非常に緩やかな減衰率に設定されているが、より速い適応が必要な場合は0.995-0.997の値を試してみても良いかも
         self.capacity = capacity
         self.priority_decay = priority_decay
         self.buffer = deque(maxlen=capacity)
@@ -507,6 +516,11 @@ class TeammatePredictor(nn.Module):
         
         Returns:
             teammate_action_logits: dict mapping agent_idx -> logits
+        
+        NOTE: Paper (Section 3.1, L140) requires stop-gradient on input:
+        "During training, the latent state input to the teammate predictor 
+        is given as sg(z_0:T), where sg(·) denotes the stop-gradient operator."
+        However, stop-gradient should be applied at the call site, not here.
         """
         z_flat = z.reshape(*z.shape[:-2], -1)
         

@@ -83,12 +83,27 @@
 2. **IMPLEMENTATION_SUMMARY.md**: 実装の完全なドキュメント
 3. **matwm_implementation.py**: World Modelコンポーネント
 4. **matwm_agent.py**: 完全なエージェント実装
-5. **2026_MATWM_simple_tag_Implementation.ipynb**: メインNotebook
+5. **curiosity_reward.py**: 好奇心駆動型報酬とγ-Progress実装
+
+### 実験用Notebook
+
+実験は `experiments/` ディレクトリに配置され、各メソッドごとに分類されています：
+
+- **experiments/llm_curiosity_and_γ-progress/**: LLM意味的好奇心 + γ-Progress
+- **experiments/only_llm_curiosity/**: LLM意味的好奇心のみ
+- **experiments/only_γ_progress/**: γ-Progressのみ
+
+各ディレクトリには以下のNotebookがあります：
+- フル訓練版（50,000ステップ）: `2026_MATWM_simple_tag_Implementation_*.ipynb`
+- テスト版（2,000ステップ）: `*_test.ipynb`
+
+詳細は `experiments/README.md` を参照してください。
 
 ### 参考資料
 
 - **simple_tag.md**: Simple Tag環境の詳細仕様
 - **論文/md/**: 参考論文のマークダウン版
+- **docs/**: 詳細なドキュメント群
 
 ---
 
@@ -141,23 +156,46 @@ scaled_action = action + agent_idx * action_dim
 ```bash
 pip install torch numpy matplotlib tqdm
 pip install pettingzoo[mpe] supersuit
+pip install jupyter jupyterlab ipykernel
 ```
 
 ### 訓練の実行
 
+#### ローカル環境での実行
+
 ```bash
-jupyter notebook 2026_MATWM_simple_tag_Implementation.ipynb
+# Jupyter Labを起動
+jupyter lab
+
+# ブラウザで experiments/ ディレクトリを開き、実行したい実験のNotebookを選択
+# 例:
+# - experiments/llm_curiosity_and_γ-progress/2026_MATWM_simple_tag_Implementation_gamma_true.ipynb
+# - experiments/only_llm_curiosity/2026_MATWM_simple_tag_Implementation_gamma_false.ipynb
+# - experiments/only_γ_progress/2026_MATWM_simple_tag_Implementation_oly_gamma_true.ipynb
 ```
 
-または
+#### GCP H100での実行（推奨）
 
-```python
-from matwm_implementation import MATWMConfig
-from matwm_agent import MATWMAgent
+大規模な訓練には、GCP H100 GPUの使用を推奨します：
 
-config = MATWMConfig(total_steps=100000)
-# ... (詳細はNotebook参照)
+1. **セットアップガイド**: `docs/gcp_execution/GCP_EXECUTION_GUIDE.md`
+2. **クイックスタート**: `docs/gcp_execution/QUICK_START_GCP.md`
+
+詳細な手順とコスト見積もりについては、上記ドキュメントを参照してください。
+
+#### 出力ディレクトリ構造
+
+Notebook実行時、結果は以下のディレクトリに保存されます：
+
 ```
+llm_logs/{method}/{timestamp}/
+results/{method}/{timestamp}/
+```
+
+- `{method}`: 実験メソッド名（`llm_and_gamma`, `only_llm`, `only_gamma`）
+- `{timestamp}`: 実行開始時刻（例: `20260211_100030`）
+
+これにより、複数の実行結果が混同せず、系統的に管理できます。
 
 ---
 
@@ -170,13 +208,19 @@ config = MATWMConfig(total_steps=100000)
 
 ---
 
-## 今後の拡張
+## 実装済み機能
 
-1. ✅ MATWM ベースライン実装 (完了)
-2. ⬜ γ-Progress Curiosity の導入
-3. ⬜ Theory of Mind の強化
-4. ⬜ Communication Module
-5. ⬜ 階層的プランニング
+1. ✅ MATWM ベースライン実装
+2. ✅ γ-Progress Curiosity の導入
+3. ✅ LLM意味的好奇心の実装
+4. ✅ 計算型好奇心（Dynamics, Reward, Social）
+5. ✅ 複数実験メソッドのNotebook実装
+
+## 今後の拡張（オプション）
+
+1. ⬜ Theory of Mind の強化
+2. ⬜ Communication Module
+3. ⬜ 階層的プランニング
 
 ---
 
